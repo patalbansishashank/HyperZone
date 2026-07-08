@@ -293,7 +293,7 @@ ColumnLayout {
 
           ZoneEditor {
             Layout.fillWidth: true
-            Layout.preferredHeight: 240
+            Layout.preferredHeight: 284
             zones: (root.rev, root.layoutOf(mon).zones)
             vsplit: (root.rev, root.layoutOf(mon).vsplit)
             hsplit: (root.rev, root.layoutOf(mon).hsplit)
@@ -390,61 +390,110 @@ ColumnLayout {
     onVsplitChanged: _v = vsplit
     onHsplitChanged: _h = hsplit
 
-    Rectangle {
-      id: canvas
-      anchors.centerIn: parent
-      width: Math.min(parent.width, parent.height * 16 / 9)
-      height: width * 9 / 16
-      color: "transparent"
+    // Commit a split from any source (drag or typed %), clamping to 5–95%.
+    function setV(frac) {
+      var nv = Math.max(0.05, Math.min(0.95, frac))
+      if (Math.abs(nv - ze._v) < 0.0005) return
+      ze._v = nv
+      ze.splitChanged(ze._v, ze.zones === 4 ? ze._h : null)
+    }
+    function setH(frac) {
+      var nh = Math.max(0.05, Math.min(0.95, frac))
+      if (Math.abs(nh - ze._h) < 0.0005) return
+      ze._h = nh
+      ze.splitChanged(ze._v, ze._h)
+    }
 
-      Repeater {
-        model: {
-          var v = ze._v * canvas.width, h = ze._h * canvas.height, W = canvas.width, H = canvas.height
-          if (ze.zones === 2)
-            return [{ zi: 0, x: 0, y: 0, w: v, h: H }, { zi: 1, x: v, y: 0, w: W - v, h: H }]
-          return [{ zi: 0, x: 0, y: 0, w: v, h: h }, { zi: 1, x: v, y: 0, w: W - v, h: h },
-                  { zi: 2, x: 0, y: h, w: v, h: H - h }, { zi: 3, x: v, y: h, w: W - v, h: H - h }]
-        }
-        delegate: Rectangle {
-          x: modelData.x; y: modelData.y; width: modelData.w; height: modelData.h
-          color: Color.mSurfaceVariant; border.color: Color.mOutline; border.width: 1; radius: Style.radiusXS
-          NText {
-            anchors.centerIn: parent
-            text: (ze.fill.indexOf(modelData.zi) + 1) + (ze.subdivide.indexOf(modelData.zi) !== -1 ? "  ⊞" : "")
-            color: Color.mOnSurfaceVariant; pointSize: Style.fontSizeS
+    ColumnLayout {
+      anchors.fill: parent
+      spacing: Style.marginS
+
+      Item {
+        Layout.fillWidth: true
+        Layout.fillHeight: true
+
+        Rectangle {
+          id: canvas
+          anchors.centerIn: parent
+          width: Math.min(parent.width, parent.height * 16 / 9)
+          height: width * 9 / 16
+          color: "transparent"
+
+          Repeater {
+            model: {
+              var v = ze._v * canvas.width, h = ze._h * canvas.height, W = canvas.width, H = canvas.height
+              if (ze.zones === 2)
+                return [{ zi: 0, x: 0, y: 0, w: v, h: H }, { zi: 1, x: v, y: 0, w: W - v, h: H }]
+              return [{ zi: 0, x: 0, y: 0, w: v, h: h }, { zi: 1, x: v, y: 0, w: W - v, h: h },
+                      { zi: 2, x: 0, y: h, w: v, h: H - h }, { zi: 3, x: v, y: h, w: W - v, h: H - h }]
+            }
+            delegate: Rectangle {
+              x: modelData.x; y: modelData.y; width: modelData.w; height: modelData.h
+              color: Color.mSurfaceVariant; border.color: Color.mOutline; border.width: 1; radius: Style.radiusXS
+              NText {
+                anchors.centerIn: parent
+                text: (ze.fill.indexOf(modelData.zi) + 1) + (ze.subdivide.indexOf(modelData.zi) !== -1 ? "  ⊞" : "")
+                color: Color.mOnSurfaceVariant; pointSize: Style.fontSizeS
+              }
+            }
+          }
+
+          // vertical divider
+          Rectangle {
+            width: 6; height: canvas.height; radius: 3; color: Color.mPrimary
+            x: ze._v * canvas.width - width / 2; y: 0
+            MouseArea {
+              anchors.fill: parent; anchors.margins: -8
+              cursorShape: Qt.SplitHCursor
+              onPositionChanged: {
+                if (!pressed) return
+                var p = mapToItem(canvas, mouseX, mouseY)
+                ze.setV(p.x / canvas.width)
+              }
+            }
+          }
+
+          // horizontal divider (4-zone only)
+          Rectangle {
+            visible: ze.zones === 4
+            width: canvas.width; height: 6; radius: 3; color: Color.mPrimary
+            x: 0; y: ze._h * canvas.height - height / 2
+            MouseArea {
+              anchors.fill: parent; anchors.margins: -8
+              cursorShape: Qt.SplitVCursor
+              onPositionChanged: {
+                if (!pressed) return
+                var p = mapToItem(canvas, mouseX, mouseY)
+                ze.setH(p.y / canvas.height)
+              }
+            }
           }
         }
       }
 
-      // vertical divider
-      Rectangle {
-        width: 6; height: canvas.height; radius: 3; color: Color.mPrimary
-        x: ze._v * canvas.width - width / 2; y: 0
-        MouseArea {
-          anchors.fill: parent; anchors.margins: -8
-          cursorShape: Qt.SplitHCursor
-          onPositionChanged: {
-            if (!pressed) return
-            var p = mapToItem(canvas, mouseX, mouseY)
-            ze._v = Math.max(0.05, Math.min(0.95, p.x / canvas.width))
-            ze.splitChanged(ze._v, ze.zones === 4 ? ze._h : null)
+      // Typed percentages — the left column's width, and (4-zone) the top row's height.
+      RowLayout {
+        Layout.alignment: Qt.AlignHCenter
+        spacing: Style.marginL
+
+        RowLayout {
+          spacing: Style.marginS
+          NText { text: "Left"; Layout.alignment: Qt.AlignVCenter; color: Color.mOnSurfaceVariant; pointSize: Style.fontSizeS }
+          NSpinBox {
+            from: 5; to: 95; stepSize: 1; suffix: "%"
+            value: Math.round(ze._v * 100)
+            onValueChanged: ze.setV(value / 100)
           }
         }
-      }
 
-      // horizontal divider (4-zone only)
-      Rectangle {
-        visible: ze.zones === 4
-        width: canvas.width; height: 6; radius: 3; color: Color.mPrimary
-        x: 0; y: ze._h * canvas.height - height / 2
-        MouseArea {
-          anchors.fill: parent; anchors.margins: -8
-          cursorShape: Qt.SplitVCursor
-          onPositionChanged: {
-            if (!pressed) return
-            var p = mapToItem(canvas, mouseX, mouseY)
-            ze._h = Math.max(0.05, Math.min(0.95, p.y / canvas.height))
-            ze.splitChanged(ze._v, ze._h)
+        RowLayout {
+          visible: ze.zones === 4
+          spacing: Style.marginS
+          NText { text: "Top"; Layout.alignment: Qt.AlignVCenter; color: Color.mOnSurfaceVariant; pointSize: Style.fontSizeS }
+          NSpinBox {
+            from: 5; to: 95; stepSize: 1; suffix: "%"
+            value: Math.round(ze._h * 100)
+            onValueChanged: ze.setH(value / 100)
           }
         }
       }
