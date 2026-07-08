@@ -1,0 +1,17 @@
+{
+  "id": "hyperzone",
+  "name": "HyperZone",
+  "version": "2.0.0",
+  "minNoctaliaVersion": "4.0.0",
+  "author": "Shashank Patalbansi",
+  "license": "MIT",
+  "repository": "https://github.com/patalbansishashank/HyperZone",
+  "description": "The thing you always wanted for Hyprland with bigger displays — zone tiling for your big screens plus a real drag-and-drop display editor.",
+  "entryPoints": {
+    "main": "Main.qml",
+    "settings": "Settings.qml"
+  },
+  "metadata": {
+    "defaultSettings": {}
+  }
+}
