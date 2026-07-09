@@ -1248,22 +1248,27 @@ class HyperZone:
 
     # -- full re-adopt (startup / recovery) --
     def retile(self, restore=False, force=False):
-        """Re-adopt windows on every managed monitor.
+        """Re-tile the managed monitors.
 
-        force=True is the manual "rearrange everything smartly" recovery: it wipes
-        the layout, forgets deliberate float-outs, and grabs *every* normal window
-        on the managed screen — including ones that are floating (which the normal
-        adoption path skips). Use it when a window slipped through untracked and is
-        sitting at some odd size that Super+T alone won't fix.
+        force=True — the "rearrange everything" reset (Super+Shift+T): wipe every
+        zone, forget deliberate float-outs, and re-grab EVERY normal window (even
+        floating ones) in fill order. Use it to reclaim a window that slipped through
+        untracked, or to deliberately reshuffle.
+
+        force=False — a gentle re-snap (Re-tile / Super+Shift+R, and config Apply):
+        KEEP the current arrangement (reseed already preserves each tracked window's
+        zone), only re-assert geometry to undo drift and adopt any untracked tileable
+        window into an empty zone. It does NOT reshuffle windows placed by hand.
+
+        restore=True — reload the saved layout after a same-session daemon restart.
         """
-        self.reseed()
-        if force:
-            self.detached.clear()
+        self.reseed()               # rebuilds self.mons, preserving trees where zones still fit
         if restore:
             self.load()              # restore prior layout (same-session restart)
-        else:
+        elif force:
+            self.detached.clear()
             for mon in self.mons.values():
-                mon.trees = [None] * len(mon.cells)
+                mon.trees = [None] * len(mon.cells)   # only the hard reset wipes
         clients = hjson("clients") or []
         mons = hjson("monitors") or []
         id2name = {m["id"]: m["name"] for m in mons}
@@ -1431,18 +1436,32 @@ class Daemon(HyperZone):
     def rpc_get_monitors(self, params):
         return {"monitors": self.live_monitors()}
 
+    @staticmethod
+    def _tiling_sig():
+        """Signature of the parts of the config that affect how windows tile — the
+        managed set and each monitor's compiled zones/fill/nice + enabled flag. Apply
+        only re-tiles when THIS changes, so editing keybinds, deny-classes or border
+        colours never disturbs the current window arrangement."""
+        return {name: (bool(m.get("enabled", True)), tuple(m.get("cells", ())),
+                       tuple(m.get("fill", ())), tuple(m.get("nice", ())))
+                for name, m in MANAGED.items()}
+
     def rpc_set_config(self, params):
         global USER_CONFIG
         cfg = params.get("config")
         if not isinstance(cfg, dict):
             raise ValueError("missing/invalid config")
+        old_sig = self._tiling_sig()
         apply_config(cfg)              # validates first -> globals untouched on error
         self._write_config(cfg)
         USER_CONFIG = cfg
         refresh_gaps()
-        self.reseed()
-        self.retile(force=True)
         self.register_keybinds()       # apply any changed key combos live
+        # Only re-tile when the zone layout / managed set actually changed — and then
+        # gently (preserve hand-placed windows, just fit the new zones). A keybind or
+        # colour edit leaves every window exactly where it is.
+        if self._tiling_sig() != old_sig:
+            self.retile()
         self.emit("config_changed", {"config": self.effective_config()})
         return {"config": self.effective_config()}
 
@@ -1542,7 +1561,7 @@ class Daemon(HyperZone):
         return "hl.dsp.focus(" in s and "direction" in s
 
     def rpc_retile(self, params):
-        self.retile(force=True)
+        self.retile()   # gentle re-snap (preserve arrangement); rearrange is the hard reset
         return {"ok": True}
 
     def rpc_set_capture_mode(self, params):

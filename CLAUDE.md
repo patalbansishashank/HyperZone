@@ -146,8 +146,16 @@ map ids to hzctl invocations and seed the defaults.
   not a namespace — `hl.dsp.focus.window` does not exist). migrate_keybinds also comments the native
   directional-focus binds out of hyprland.lua (workspace-focus binds have `workspace=` not
   `direction`, so they stay); it now re-scans each startup so upgrades pick up newly-owned actions.
-- `retile` (Super+Shift+R) re-snaps windows into their zones; `rearrange` (Super+Shift+T) is the
-  hard reset that also reclaims floated windows.
+- **retile is gentle; rearrange is the reset.** `retile(force=False)` (Re-tile button, Super+Shift+R,
+  and config Apply) KEEPS the current arrangement — `reseed()` preserves each tracked window's zone
+  and retile only re-asserts geometry (undo drift) + adopts untracked windows. It must NOT wipe the
+  trees (the old bug: the non-force path did `mon.trees = [None]*…` then re-placed everyone in fill
+  order, reshuffling hand-placed windows). Only `force=True` (rearrange, Super+Shift+T) wipes, clears
+  `detached`, and re-grabs every window incl. floating ones.
+- **Apply (`set_config`) only re-tiles when the layout actually changed** — it compares `_tiling_sig()`
+  (managed set + each monitor's compiled zones/fill/nice/enabled) before vs after, and skips the
+  retile entirely for keybind/deny/border edits. When it does retile, it's the gentle one. (Was an
+  unconditional `retile(force=True)` on every Apply → reshuffled windows on any settings change.)
 
 ## Git / push
 
