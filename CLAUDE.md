@@ -102,8 +102,17 @@ map ids to hzctl invocations and seed the defaults.
 - `binds -j` shows Lua-registered binds with a **numeric `arg`** (a Lua callback ref), not the
   command string — filter by `modmask`/`key`, not by `arg`. modmask: SHIFT=1 CTRL=4 SUPER=64
   (so SUPER+CTRL=68, SUPER+SHIFT=65, SUPER+CTRL+SHIFT=69).
-- **In-app press-to-capture doesn't work** for bound chords: the compositor grabs them before
-  the focused app sees the keypress. The settings UI uses **typed combos** (normalized) instead.
+- **Press-to-capture** in the settings UI: a `KeybindRecorder` inline component records the pressed
+  chord (handles Super/Meta, emits `"SUPER + CTRL + left"` form). Because Hyprland fires bound chords
+  globally (Super+← would trigger our focus bind, not reach the popup), recording calls the daemon's
+  `set_capture_mode` RPC which **unbinds all live binds** for the duration, then re-registers on
+  stop — with a `CAPTURE_MODE_TIMEOUT` backstop in `tick()` so a UI that dies mid-record can't leave
+  keys dead. It also sets `PanelService.isKeybindRecording` so the panel's own key handlers stand
+  down. (Noctalia's built-in `NKeybindRecorder`/`getKeybindString` is unusable here — it drops the
+  Super modifier entirely.)
+- **`effective_config` returns the MERGED keybinds** (`KEYBINDS`), never the raw saved set — so
+  actions added in a newer build (focus-*) show up in the UI even when config.json predates them.
+  (Was `setdefault`, which left an existing on-disk `keybinds` untouched → focus binds invisible.)
 - `migrate_keybinds()` comments the hand-written HyperZone *keyboard* binds out of hyprland.lua
   once (marker `-- hyperzone-managed keybinds`, backup `hyprland.lua.hz-kb-backup`), leaving the
   **mouse drag-binds** (snap-drop/float-drop) and every non-HyperZone bind alone. Matches the

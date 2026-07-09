@@ -128,6 +128,7 @@ DENY_PLACE_MAX_TRIES = 12    # …until it stops changing (settled) or this many
 FS_INSIST_WINDOW = 1.5       # re-fullscreen within this = app insists; stop fighting
 MON_CACHE_TTL = 1.0          # monitors-list micro-cache (also event-invalidated)
 CROSS_PLACE_TIMEOUT = 2.0    # honour a cross-monitor move's aligned-zone intent this long
+CAPTURE_MODE_TIMEOUT = 20.0  # auto-restore binds if the UI's key-capture never resumes them
 
 
 def _clampf(v, lo, hi):
@@ -1320,6 +1321,9 @@ class Daemon(HyperZone):
         self.layout_revert_at = None    # deadline to auto-revert a pending display layout
         self.layout_prev_specs = None   # live specs snapshotted before an apply (for exact revert)
         self.monitors_refresh_at = None # deadline for a deferred (settled) monitors_changed push
+        self.capture_resume_at = None   # while set, our keybinds are suspended so the UI can
+                                        # record a chord Hyprland would otherwise grab; a deadline
+                                        # backstop re-registers them if the UI never resumes
         self.learn_suppress_until = 0.0 # no minsize learning until then (display transitions
                                         # freeze windows at stale sizes long enough to look
                                         # "stable" and teach garbage, e.g. a zone-wide min)
@@ -1393,7 +1397,10 @@ class Daemon(HyperZone):
         cfg.setdefault("adopt_delay", ADOPT_DELAY)
         cfg.setdefault("border_float", BORDER_FLOAT)
         cfg.setdefault("border_float_inactive", BORDER_FLOAT_INACTIVE)
-        cfg.setdefault("keybinds", {k: list(v) for k, v in KEYBINDS.items()})
+        # ALWAYS the merged set (defaults + user overrides), never the raw saved
+        # keybinds — so actions added in a newer build (e.g. focus-*) show up in the
+        # UI even when the on-disk config predates them.
+        cfg["keybinds"] = {k: list(v) for k, v in KEYBINDS.items()}
         return cfg
 
     def state_snapshot(self):
@@ -1536,6 +1543,22 @@ class Daemon(HyperZone):
 
     def rpc_retile(self, params):
         self.retile(force=True)
+        return {"ok": True}
+
+    def rpc_set_capture_mode(self, params):
+        """Suspend/restore our live keybinds so the settings UI can RECORD a chord.
+        Hyprland fires bound chords globally, so pressing e.g. Super+←  would trigger
+        our focus bind instead of reaching the recorder. On (True) we unbind them all;
+        Off (False) re-registers from the current config. A deadline backstop in
+        tick() restores them even if the UI dies mid-record, so keys can't stay dead."""
+        if params.get("on"):
+            for combo in list(getattr(self, "active_binds", {})):
+                self._heval('hl.unbind("%s")' % combo)
+            self.active_binds = {}
+            self.capture_resume_at = time.time() + CAPTURE_MODE_TIMEOUT
+        else:
+            self.capture_resume_at = None
+            self.register_keybinds(initial=True)
         return {"ok": True}
 
     # -- display layout (real reconfigure, with confirm-or-revert safety) --
@@ -1689,6 +1712,7 @@ class Daemon(HyperZone):
         "get_monitors": rpc_get_monitors,
         "set_config": rpc_set_config,
         "retile": rpc_retile,
+        "set_capture_mode": rpc_set_capture_mode,
         "apply_monitor_layout": rpc_apply_monitor_layout,
         "confirm_monitor_layout": rpc_confirm_monitor_layout,
         "revert_monitor_layout": rpc_revert_monitor_layout,
@@ -1764,6 +1788,9 @@ class Daemon(HyperZone):
             self.place_deny_step(addr)
         for addr in [a for a, o in self.cross_place.items() if o[2] <= now]:
             self.cross_place.pop(addr, None)   # move never adopted -> drop stale intent
+        if self.capture_resume_at is not None and now >= self.capture_resume_at:
+            self.capture_resume_at = None      # UI never resumed -> restore keybinds
+            self.register_keybinds(initial=True)
         if self.verify_at is not None and now >= self.verify_at:
             self.verify_at = None
             self.run_verify()
@@ -1796,6 +1823,8 @@ class Daemon(HyperZone):
             deadlines.append(self.layout_revert_at)
         if self.monitors_refresh_at is not None:
             deadlines.append(self.monitors_refresh_at)
+        if self.capture_resume_at is not None:
+            deadlines.append(self.capture_resume_at)
         if not deadlines:
             return None
         return max(0.0, min(deadlines) - time.time())
