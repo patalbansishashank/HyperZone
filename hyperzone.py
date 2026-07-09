@@ -922,15 +922,26 @@ class HyperZone:
         return [zi for _, _, zi in ranked]
 
     def _place_ranked(self, addr, mon, ranked):
-        """Whole-fill the first EMPTY zone in `ranked`. True if placed; False if every
-        zone is occupied (caller falls back to the normal nice/overflow path)."""
+        """Land addr in the best-aligned zone from `ranked` (see rank_entry_zones):
+        the first EMPTY one whole; or, if every zone is already occupied, subdivide
+        the top-ranked zone so it still lands on the aligned side (bottom-origin ->
+        bottom zone) instead of the normal nice/overflow default, which fills the top
+        first. Always places when `ranked` is non-empty."""
         for zi in ranked:
             if mon.trees[zi] is None:
                 self.was_managed.discard(addr)
                 mon.trees[zi] = leaf(addr)
-                dlog("cross-place", addr, "-> zone", zi + 1, mon.name)
+                dlog("cross-place", addr, "-> empty zone", zi + 1, mon.name)
                 self.apply(mon)
                 return True
+        if ranked:
+            zi = ranked[0]
+            lf, rect = next(walk(mon.trees[zi], mon.zone_rect(zi)))
+            split_leaf(lf, addr, rect, new_first=self._new_first(mon, rect))
+            self.was_managed.discard(addr)
+            dlog("cross-place", addr, "-> split zone", zi + 1, mon.name)
+            self.apply(mon)
+            return True
         return False
 
     def place(self, addr, mon):

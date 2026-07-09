@@ -123,8 +123,11 @@ map ids to hzctl invocations and seed the defaults.
   window sent to a monitor we tile lands in the zone matching where it came from (top→top,
   bottom→bottom; entered-from-left→left column) instead of blind fill order. `cmd_tomon` records
   `{addr: (mon_name, ranked_zone_ids, deadline)}`; `place()` consumes it on arrival (the window is
-  still momentarily tiled when `on_moved` reads it, so `is_tileable` passes and it adopts). Expires
-  after `CROSS_PLACE_TIMEOUT`; pruned in `tick()` and on closewindow.
+  still momentarily tiled when `on_moved` reads it, so `is_tileable` passes and it adopts). If the
+  aligned zone is empty it fills it whole; if EVERY zone is occupied it **subdivides the aligned
+  zone** (not the normal nice/overflow default, which fills the top first — that was the "bottom
+  window lands top on a full monitor" bug). Expires after `CROSS_PLACE_TIMEOUT`; pruned in `tick()`
+  and on closewindow.
 - `focus <dir>` (Super+arrows / HJKL) is layout-aware too: same-screen → native `hl.dsp.focus`
   (instant, handles floating/groups); at the screen edge → cross to `pick_monitor_in_dir` and land
   on the aligned `_entry_window` there (or `focus({monitor=…})` if that screen is empty). Focus
