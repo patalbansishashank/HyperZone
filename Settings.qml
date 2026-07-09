@@ -49,10 +49,15 @@ ColumnLayout {
   function layoutOf(name) { return monEntry(name).layout }
   function defaultFill(z) { var a = []; for (var i = 0; i < z; i++) a.push(z - 1 - i); return a }
   function fillOf(name) { var l = layoutOf(name); return l.fill || defaultFill(l.zones) }
-  function zoneLabel(zones, zi) {
-    if (zones === 2) return zi === 0 ? "Zone 1 (left)" : "Zone 2 (right)"
-    return ["Zone 1 (top-left)", "Zone 2 (top-right)", "Zone 3 (bottom-left)", "Zone 4 (bottom-right)"][zi]
-  }
+  // Zones are named by a fixed colour, not a number — the number badge in the
+  // preview is the *fill order* (which window lands where), and reusing 1/2/3/4
+  // for identity was confusing. Colour is tied to the canonical cell index zi
+  // (2 zones → 0=left,1=right · 4 zones → 0=TL,1=TR,2=BL,3=BR) so it never shifts.
+  readonly property var zoneNames: ["Blue", "Green", "Orange", "Red"]
+  readonly property var zoneEmojis: ["🟦", "🟩", "🟧", "🟥"]
+  readonly property var zoneHexes: ["#4c8dff", "#3fc16a", "#f59234", "#ef5350"]
+  function zoneColor(zi) { return root.zoneHexes[zi] || "#888888" }
+  function zoneLabel(zones, zi) { return (root.zoneEmojis[zi] || "") + " " + (root.zoneNames[zi] || ("Zone " + (zi + 1))) }
 
   function setEnabled(name, on) { monEntry(name).enabled = on; rev++; apply() }
   function setZones(name, z) {
@@ -128,7 +133,7 @@ ColumnLayout {
   Component.onCompleted: if (hz && hz.daemonReady) { reload(); reloadDisplays() }
 
   // =======================================================================
-  NHeader { Layout.fillWidth: true; label: "HyperZone"; description: "Zone tiling + display editor for Hyprland" }
+  // (No in-page header — the plugin settings popup already titles this pane.)
 
   ColumnLayout {
     Layout.fillWidth: true; Layout.topMargin: Style.marginXL
@@ -232,31 +237,18 @@ ColumnLayout {
         }
       }
 
-      // migration gate + apply
-      ColumnLayout {
-        Layout.fillWidth: true
-        visible: root.hz && !root.hz.migrated
-        spacing: Style.marginXS
-        NText {
-          Layout.fillWidth: true; wrapMode: Text.WordWrap
-          text: "To edit displays, HyperZone moves your monitor setup out of hyprland.lua into a " +
-                "generated monitors.lua it manages (a timestamped backup is kept). One-time."
-          pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
-        }
-        NButton {
-          text: "Migrate hyprland.lua → monitors.lua"
-          onClicked: root.hz.request("migrate_hyprland_config", {}, function (r, e) {
-            if (e) ToastService.showError("HyperZone", "Migration failed: " + e)
-            else if (r && r.changed) { ToastService.showNotice("HyperZone", "Migrated. Backup: " + r.backup); root.hz.refresh() }
-            else ToastService.showNotice("HyperZone", "Already migrated")
-          })
-        }
-      }
+      // apply (live — no migration needed; confirm-or-revert keeps it safe)
       NButton {
         text: "Apply display layout"
-        visible: root.hz && root.hz.migrated
         enabled: root.hz && root.hz.pendingLayout === null
         onClicked: root.applyDisplays()
+      }
+      NText {
+        Layout.fillWidth: true; wrapMode: Text.WordWrap
+        visible: root.hz && !root.hz.migrated
+        text: "Display changes apply immediately, but reset when Hyprland reloads its config. " +
+              "To make them permanent, use “Persist displays” in the General tab (one-time)."
+        pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
       }
     }
 
@@ -333,10 +325,10 @@ ColumnLayout {
         }
       }
 
-      RowLayout {
-        Layout.fillWidth: true; Layout.topMargin: Style.marginS; spacing: Style.marginM
-        NButton { text: "Apply zone layout"; onClicked: root.apply() }
-        NButton { text: "Re-tile now"; outlined: true; onClicked: if (root.hz) root.hz.request("retile", {}) }
+      NText {
+        Layout.fillWidth: true; Layout.topMargin: Style.marginS; wrapMode: Text.WordWrap
+        text: "Changes take effect when you press Apply at the bottom of this panel."
+        pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
       }
     }
 
@@ -370,7 +362,32 @@ ColumnLayout {
         text: (root.rev, root.edit.border_float_inactive || "rgb(6b4d00)")
         onEditingFinished: root.edit.border_float_inactive = text.trim()
       }
-      NButton { text: "Apply"; Layout.topMargin: Style.marginS; onClicked: root.apply() }
+
+      NButton {
+        text: "Re-tile now"
+        outlined: true
+        Layout.topMargin: Style.marginS
+        onClicked: if (root.hz) root.hz.request("retile", {})
+      }
+
+      // Persist displays (one-time migration). Greyed out once done — nothing left to do.
+      Rectangle { Layout.fillWidth: true; Layout.topMargin: Style.marginM; Layout.preferredHeight: 1; color: Color.mOutline }
+      NLabel { label: "Persist display setup"; description: "Optional · make display edits survive a Hyprland reload" }
+      NText {
+        Layout.fillWidth: true; wrapMode: Text.WordWrap
+        text: "Moves your monitor setup out of hyprland.lua into a HyperZone-managed monitors.lua " +
+              "(a timestamped backup is kept). Do this once; after that, display edits persist automatically."
+        pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
+      }
+      NButton {
+        text: (root.hz && root.hz.migrated) ? "Displays already persisted ✓" : "Persist displays to monitors.lua"
+        enabled: root.hz && !root.hz.migrated
+        onClicked: root.hz.request("migrate_hyprland_config", {}, function (r, e) {
+          if (e) ToastService.showError("HyperZone", "Persist failed: " + e)
+          else if (r && r.changed) { ToastService.showNotice("HyperZone", "Displays persisted. Backup: " + r.backup); root.hz.refresh() }
+          else { ToastService.showNotice("HyperZone", "Already persisted"); root.hz.refresh() }
+        })
+      }
     }
   }
 
@@ -383,6 +400,13 @@ ColumnLayout {
     property var fill: []
     property var subdivide: []
     signal splitChanged(real v, real h)
+
+    // Same fixed zone palette as the reorder list (zi → colour). zoneFill is the
+    // #AARRGGBB translucent tint (alpha 0x38 ≈ 22%) for the zone body.
+    readonly property var zoneHex: ["#4c8dff", "#3fc16a", "#f59234", "#ef5350"]
+    readonly property var zoneFill: ["#384c8dff", "#383fc16a", "#38f59234", "#38ef5350"]
+    function zc(zi) { return ze.zoneHex[zi] || Color.mOutline }
+    function zf(zi) { return ze.zoneFill[zi] || Color.mSurfaceVariant }
 
     // live drag state (owned here so dragging is smooth; resynced when props change)
     property real _v: vsplit
@@ -429,11 +453,13 @@ ColumnLayout {
             }
             delegate: Rectangle {
               x: modelData.x; y: modelData.y; width: modelData.w; height: modelData.h
-              color: Color.mSurfaceVariant; border.color: Color.mOutline; border.width: 1; radius: Style.radiusXS
+              color: ze.zf(modelData.zi)
+              border.color: ze.zc(modelData.zi); border.width: 2; radius: Style.radiusXS
               NText {
                 anchors.centerIn: parent
+                // number = fill order (which window lands here); ⊞ = subdivides
                 text: (ze.fill.indexOf(modelData.zi) + 1) + (ze.subdivide.indexOf(modelData.zi) !== -1 ? "  ⊞" : "")
-                color: Color.mOnSurfaceVariant; pointSize: Style.fontSizeS
+                color: Color.mOnSurface; pointSize: Style.fontSizeL; font.weight: Style.fontWeightBold
               }
             }
           }
@@ -552,37 +578,69 @@ ColumnLayout {
     Repeater {
       model: (dc._rev, dc._mons.length)
       delegate: Rectangle {
+        id: monRect
         readonly property var d: dc._mons[index]
         readonly property var ls: dc._logical(d)
-        x: (dc._rev, dc.offx + (d.x - dc.bb.minx) * dc.sc)
-        y: (dc._rev, dc.offy + (d.y - dc.bb.miny) * dc.sc)
+        // Pixel drag offset layered on top of the committed (world-derived) position.
+        // During a drag ONLY this changes — the bbox/scale/other rects stay frozen —
+        // so dragging is smooth instead of reflowing the whole canvas every mouse move.
+        property real dragDX: 0
+        property real dragDY: 0
+        property bool dragging: false
+        x: (dc._rev, dc.offx + (d.x - dc.bb.minx) * dc.sc + dragDX)
+        y: (dc._rev, dc.offy + (d.y - dc.bb.miny) * dc.sc + dragDY)
         width: (dc._rev, ls.w * dc.sc)
         height: (dc._rev, ls.h * dc.sc)
+        z: dragging ? 10 : 0
         color: Color.mSurfaceVariant
         border.color: index === dc.selectedIndex ? Color.mPrimary : Color.mOutline
         border.width: index === dc.selectedIndex ? 2 : 1
         radius: Style.radiusXS
         opacity: d.disabled ? 0.4 : 1
+        // Animate the settle after a drop (and any re-fit), but not the drag itself.
+        Behavior on x { enabled: !monRect.dragging; NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
+        Behavior on y { enabled: !monRect.dragging; NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
 
         Column {
           anchors.centerIn: parent
-          NText { anchors.horizontalCenter: parent.horizontalCenter; text: d.name; pointSize: Style.fontSizeXS; font.weight: Style.fontWeightSemiBold }
-          NText { anchors.horizontalCenter: parent.horizontalCenter; text: String(d.mode).split("@")[0]; pointSize: Style.fontSizeXXS; color: Color.mOnSurfaceVariant }
+          NText { anchors.horizontalCenter: parent.horizontalCenter; text: monRect.d.name; pointSize: Style.fontSizeXS; font.weight: Style.fontWeightSemiBold }
+          NText { anchors.horizontalCenter: parent.horizontalCenter; text: String(monRect.d.mode).split("@")[0]; pointSize: Style.fontSizeXXS; color: Color.mOnSurfaceVariant }
         }
 
         MouseArea {
           anchors.fill: parent
-          property real ox: 0
-          property real oy: 0
-          onPressed: (m) => { dc.select(index); ox = m.x; oy = m.y }
+          property real startX: 0   // pointer at press, in canvas coords (stable as the rect moves)
+          property real startY: 0
+          property real baseDX: 0
+          property real baseDY: 0
+          onPressed: (m) => {
+            dc.select(index)
+            var p = mapToItem(dc, m.x, m.y)
+            startX = p.x; startY = p.y
+            baseDX = monRect.dragDX; baseDY = monRect.dragDY
+            monRect.dragging = true
+          }
           onPositionChanged: (m) => {
             if (!pressed) return
-            var wx = d.x + (m.x - ox) / dc.sc
-            var wy = d.y + (m.y - oy) / dc.sc
+            var p = mapToItem(dc, m.x, m.y)
+            var rawDX = baseDX + (p.x - startX)
+            var rawDY = baseDY + (p.y - startY)
+            // snap in world space with the scale frozen — magnetic but jitter-free
+            var wx = monRect.d.x + rawDX / dc.sc
+            var wy = monRect.d.y + rawDY / dc.sc
             var sn = dc._snap(index, wx, wy)
-            dc._mons[index].x = sn.x; dc._mons[index].y = sn.y; dc._rev++
+            monRect.dragDX = (sn.x - monRect.d.x) * dc.sc
+            monRect.dragDY = (sn.y - monRect.d.y) * dc.sc
           }
-          onReleased: dc.moved(index, dc._mons[index].x, dc._mons[index].y)
+          onReleased: {
+            monRect.dragging = false
+            var wx = Math.round(monRect.d.x + monRect.dragDX / dc.sc)
+            var wy = Math.round(monRect.d.y + monRect.dragDY / dc.sc)
+            monRect.dragDX = 0; monRect.dragDY = 0
+            dc._mons[index].x = wx; dc._mons[index].y = wy
+            dc._rev++                       // single reflow/re-fit after the drop
+            dc.moved(index, wx, wy)
+          }
         }
       }
     }

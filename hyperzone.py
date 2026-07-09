@@ -282,6 +282,22 @@ def generate_monitors_lua(specs):
     return "\n".join(out) + "\n"
 
 
+def lua_monitor(spec):
+    """Render one monitor spec as an `hl.monitor({...})` Lua call, suitable for
+    Hyprland's runtime `eval` endpoint. This is how displays are reconfigured LIVE
+    (the Lua/non-legacy config parser rejects `keyword monitor`; `eval` runs the
+    same hl.monitor the config would). Instant, no reload, no migration needed."""
+    if spec.get("disabled"):
+        return 'hl.monitor({output="%s", mode="disable"})' % spec["name"]
+    parts = ['output="%s"' % spec["name"],
+             'mode="%s"' % str(spec.get("mode", "preferred")).replace("Hz", ""),
+             'position="%dx%d"' % (int(spec.get("x", 0)), int(spec.get("y", 0))),
+             'scale="%s"' % spec.get("scale", 1)]
+    if int(spec.get("transform", 0)):
+        parts.append("transform=%d" % int(spec["transform"]))
+    return "hl.monitor({%s})" % ", ".join(parts)
+
+
 def migrate_lua_text(text):
     """Comment out every hl.monitor({...}) block in hyprland.lua and insert a
     `dofile(monitors.lua)` line where the first one was. Pure string transform so
@@ -1099,6 +1115,7 @@ class Daemon(HyperZone):
         self.stdio = False          # RPC-over-stdio mode (owned by a Noctalia plugin)
         self.rpc_out = None         # private handle to the REAL stdout (see run())
         self.layout_revert_at = None    # deadline to auto-revert a pending display layout
+        self.layout_prev_specs = None   # live specs snapshotted before an apply (for exact revert)
 
     # -- JSON-RPC over stdio (plugin control channel) --
     def _rpc_write(self, obj):
@@ -1224,7 +1241,7 @@ class Daemon(HyperZone):
             subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=5)
 
     def _live_specs(self):
-        """Current live monitors as generator specs (basis for the first monitors.lua)."""
+        """Current live monitors as generator specs (basis for revert / first monitors.lua)."""
         specs = []
         for m in self.live_monitors():
             if m.get("disabled"):
@@ -1237,13 +1254,21 @@ class Daemon(HyperZone):
                               "scale": m.get("scale", 1), "transform": m.get("transform", 0)})
         return specs
 
+    def _apply_live_specs(self, specs):
+        """Reconfigure monitors at runtime via Hyprland's Lua `eval` — instant, no
+        reload, and it works whether or not hyprland.lua has been migrated."""
+        for spec in specs:
+            reply = hypr_request("eval " + lua_monitor(spec))
+            if reply is not None and reply.strip() and reply.strip() != "ok":
+                log("monitor eval:", spec.get("name"), "->", reply.strip())
+
     def rpc_apply_monitor_layout(self, params):
-        """Write a new monitors.lua and reload, then arm a daemon-enforced revert:
-        unless confirm_monitor_layout arrives within timeout_s, we restore the
-        previous file automatically. Survives the UI dying or every screen going
-        dark — recovery needs zero user input."""
-        if not hyprland_is_migrated():
-            raise ValueError("hyprland.lua is not migrated yet — run migrate first")
+        """Reconfigure displays LIVE (Lua `eval`), then arm a daemon-enforced revert:
+        unless confirm_monitor_layout arrives within timeout_s, we re-apply the
+        previous live specs automatically. Survives the UI dying or every screen
+        going dark — recovery needs zero user input. Migration is NOT required to
+        apply; it only decides whether the change is persisted to monitors.lua
+        (so it survives a config reload) or is runtime-only until the next reload."""
         if self.layout_revert_at is not None:
             raise ValueError("a display change is already pending confirmation")
         mons = params.get("monitors")
@@ -1269,26 +1294,30 @@ class Daemon(HyperZone):
             specs.append({"name": name, "mode": mode,
                           "x": int(m.get("x", 0)), "y": int(m.get("y", 0)),
                           "scale": m.get("scale", 1), "transform": int(m.get("transform", 0))})
-        # back up the current file so revert is exact
-        if os.path.exists(MONITORS_LUA):
+        # snapshot the exact current live state so revert is exact
+        self.layout_prev_specs = self._live_specs()
+        migrated = hyprland_is_migrated()
+        if migrated and os.path.exists(MONITORS_LUA):
             shutil.copyfile(MONITORS_LUA, MONITORS_LUA + ".pending-backup")
-        _atomic_write(MONITORS_LUA, generate_monitors_lua(specs))
-        self._reload_hyprland()
+        self._apply_live_specs(specs)                       # <- takes effect now
+        if migrated:
+            _atomic_write(MONITORS_LUA, generate_monitors_lua(specs))
         timeout_s = float(params.get("timeout_s", 15))
         self.layout_revert_at = time.time() + timeout_s
         self.emit("layout_pending", self.pending_layout_info())
-        return {"deadline": self.layout_revert_at}
+        return {"deadline": self.layout_revert_at, "persisted": migrated}
 
     def rpc_confirm_monitor_layout(self, params):
         if self.layout_revert_at is None:
             raise ValueError("no pending display change")
         self.layout_revert_at = None
-        if os.path.exists(MONITORS_LUA):
+        self.layout_prev_specs = None
+        if hyprland_is_migrated() and os.path.exists(MONITORS_LUA):
             shutil.copyfile(MONITORS_LUA, MONITORS_LUA + ".good")  # rescue snapshot
-        try:
-            os.remove(MONITORS_LUA + ".pending-backup")
-        except OSError:
-            pass
+            try:
+                os.remove(MONITORS_LUA + ".pending-backup")
+            except OSError:
+                pass
         self.emit("layout_committed", {})
         return {"ok": True}
 
@@ -1299,16 +1328,23 @@ class Daemon(HyperZone):
         return {"ok": True}
 
     def revert_layout(self, reason):
-        """Restore the pre-apply monitors.lua and reload. Daemon-driven (also fired
-        by the timeout in tick), so a bad layout always recovers on its own."""
+        """Re-apply the pre-apply live specs (and restore monitors.lua if migrated).
+        Daemon-driven (also fired by the timeout in tick), so a bad layout always
+        recovers on its own even if the UI is gone."""
         self.layout_revert_at = None
+        prev = self.layout_prev_specs
+        self.layout_prev_specs = None
+        if prev:
+            try:
+                self._apply_live_specs(prev)                # restore the actual display state
+            except Exception as e:
+                log("revert live-apply error", e)
         bak = MONITORS_LUA + ".pending-backup"
         try:
             if os.path.exists(bak):
-                os.replace(bak, MONITORS_LUA)
-                self._reload_hyprland()
+                os.replace(bak, MONITORS_LUA)               # keep the persisted file in sync
         except OSError as e:
-            log("revert_layout error", e)
+            log("revert_layout file error", e)
         log("display layout reverted:", reason)
         self.emit("layout_reverted", {"reason": reason})
 
