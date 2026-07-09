@@ -66,6 +66,83 @@ ColumnLayout {
     edit.deny_classes = (edit.deny_classes || []).filter(function (c) { return c !== cls })
     rev++
   }
+
+  // ---------- keybinds ----------
+  // Actions the daemon can bind, grouped for the UI. IDs must match the daemon's
+  // KEYBIND_CMDS. The daemon sends the full current map in config.keybinds, so the
+  // UI never needs the defaults except for the "reset" button below.
+  readonly property var keybindGroups: [
+    { title: "Move within a screen", desc: "Shuffle the focused window between zones",
+      items: [{ id: "move-left", label: "Move left" }, { id: "move-right", label: "Move right" },
+              { id: "move-up", label: "Move up" }, { id: "move-down", label: "Move down" }] },
+    { title: "Send to monitor", desc: "Throw the window to the screen in that direction",
+      items: [{ id: "tomon-left", label: "To monitor ← left" }, { id: "tomon-right", label: "To monitor → right" },
+              { id: "tomon-up", label: "To monitor ↑ up" }, { id: "tomon-down", label: "To monitor ↓ down" }] },
+    { title: "Move across everything", desc: "Rearrange in-screen, then spill to the next monitor at the edge",
+      items: [{ id: "push-left", label: "Push left" }, { id: "push-right", label: "Push right" },
+              { id: "push-up", label: "Push up" }, { id: "push-down", label: "Push down" }] },
+    { title: "Actions", desc: "",
+      items: [{ id: "toggle-float", label: "Toggle float" }, { id: "rearrange", label: "Rearrange all" },
+              { id: "retile", label: "Re-tile" }] },
+  ]
+  readonly property var defaultKeybinds: ({
+    "move-left": ["SUPER + CTRL + left", "SUPER + CTRL + H"], "move-right": ["SUPER + CTRL + right", "SUPER + CTRL + L"],
+    "move-up": ["SUPER + CTRL + up", "SUPER + CTRL + K"], "move-down": ["SUPER + CTRL + down", "SUPER + CTRL + J"],
+    "tomon-left": ["SUPER + SHIFT + left"], "tomon-right": ["SUPER + SHIFT + right"],
+    "tomon-up": ["SUPER + SHIFT + up"], "tomon-down": ["SUPER + SHIFT + down"],
+    "push-left": ["SUPER + CTRL + SHIFT + left"], "push-right": ["SUPER + CTRL + SHIFT + right"],
+    "push-up": ["SUPER + CTRL + SHIFT + up"], "push-down": ["SUPER + CTRL + SHIFT + down"],
+    "toggle-float": ["SUPER + T"], "rearrange": ["SUPER + SHIFT + T"], "retile": []
+  })
+  function combosOf(id) { var k = edit.keybinds || {}; return (k[id] || []).slice() }
+  function setCombos(id, arr) {
+    if (!edit.keybinds) edit.keybinds = ({})
+    edit.keybinds[id] = arr
+    rev++
+  }
+  // Normalise a hand-typed combo to Hyprland's canonical form, e.g.
+  // "super+ctrl+left" -> "SUPER + CTRL + left". Returns "" if there's no real key.
+  function normalizeCombo(s) {
+    var parts = String(s || "").split("+").map(function (p) { return p.trim() }).filter(function (p) { return p.length })
+    if (!parts.length) return ""
+    var modMap = { "super": "SUPER", "win": "SUPER", "meta": "SUPER", "mod": "SUPER", "cmd": "SUPER",
+                   "ctrl": "CTRL", "control": "CTRL", "alt": "ALT", "mod1": "ALT", "shift": "SHIFT" }
+    var order = ["SUPER", "CTRL", "ALT", "SHIFT"], mods = [], key = ""
+    for (var i = 0; i < parts.length; i++) {
+      var low = parts[i].toLowerCase()
+      if (modMap[low]) { if (mods.indexOf(modMap[low]) === -1) mods.push(modMap[low]) }
+      else key = parts[i]
+    }
+    if (!key) return ""
+    mods.sort(function (a, b) { return order.indexOf(a) - order.indexOf(b) })
+    var kl = key.toLowerCase()
+    if (["left", "right", "up", "down", "space", "tab", "return", "escape"].indexOf(kl) !== -1) key = kl
+    else if (key.length === 1) key = key.toUpperCase()
+    return mods.concat([key]).join(" + ")
+  }
+  // Which action currently owns `combo` (or "" if free). Guards against binding one
+  // chord to two things — Hyprland would fire both.
+  function comboOwner(combo) {
+    var k = edit.keybinds || {}
+    for (var a in k) if ((k[a] || []).indexOf(combo) !== -1) return a
+    return ""
+  }
+  function addCombo(id, raw) {
+    var combo = normalizeCombo(raw)
+    if (!combo) { ToastService.showNotice("HyperZone", "Type a combo like SUPER + CTRL + left"); return }
+    var owner = comboOwner(combo)
+    if (owner === id) return
+    if (owner) { ToastService.showNotice("HyperZone", combo + " is already bound to “" + keybindLabel(owner) + "”"); return }
+    var arr = combosOf(id); arr.push(combo); setCombos(id, arr)
+  }
+  function removeCombo(id, combo) { setCombos(id, combosOf(id).filter(function (c) { return c !== combo })) }
+  function keybindLabel(id) {
+    for (var g = 0; g < keybindGroups.length; g++)
+      for (var i = 0; i < keybindGroups[g].items.length; i++)
+        if (keybindGroups[g].items[i].id === id) return keybindGroups[g].items[i].label
+    return id
+  }
+  function resetKeybinds() { edit.keybinds = JSON.parse(JSON.stringify(defaultKeybinds)); rev++ }
   function monEntry(name) {
     if (!edit.managed[name]) edit.managed[name] = { enabled: false, layout: defaultLayout() }
     if (!edit.managed[name].layout) edit.managed[name].layout = defaultLayout()
@@ -194,7 +271,8 @@ ColumnLayout {
     currentIndex: tabView.currentIndex
     NTabButton { text: "Displays"; tabIndex: 0; checked: tabs.currentIndex === 0 }
     NTabButton { text: "Zones";    tabIndex: 1; checked: tabs.currentIndex === 1 }
-    NTabButton { text: "General";  tabIndex: 2; checked: tabs.currentIndex === 2 }
+    NTabButton { text: "Keybinds"; tabIndex: 2; checked: tabs.currentIndex === 2 }
+    NTabButton { text: "General";  tabIndex: 3; checked: tabs.currentIndex === 3 }
   }
 
   NTabView {
@@ -346,6 +424,81 @@ ColumnLayout {
         Layout.fillWidth: true; Layout.topMargin: Style.marginS; wrapMode: Text.WordWrap
         text: "Changes take effect when you press Apply at the bottom of this panel."
         pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
+      }
+    }
+
+    // ================= KEYBINDS =================
+    ColumnLayout {
+      spacing: Style.marginS
+      NLabel { label: "Keybinds"; description: "Shortcuts HyperZone binds in Hyprland" }
+
+      NText {
+        Layout.fillWidth: true; wrapMode: Text.WordWrap
+        text: "Type a combo — modifiers then a key, e.g. “SUPER + CTRL + left” — and press Enter. " +
+              "Each action can hold several. Changes apply when you press Apply below. HyperZone owns " +
+              "these keys: the matching binds in hyprland.lua are commented out (a backup is kept)."
+        pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
+      }
+
+      Repeater {
+        model: root.keybindGroups
+        delegate: ColumnLayout {
+          Layout.fillWidth: true
+          spacing: Style.marginXS
+          readonly property var group: modelData
+          NText { text: group.title; font.weight: Style.fontWeightSemiBold; Layout.topMargin: Style.marginS }
+          NText {
+            visible: group.desc.length > 0; text: group.desc
+            pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
+          }
+
+          Repeater {
+            model: group.items
+            delegate: RowLayout {
+              Layout.fillWidth: true
+              spacing: Style.marginM
+              readonly property string actId: modelData.id
+              NText {
+                text: modelData.label; Layout.preferredWidth: 140
+                Layout.alignment: Qt.AlignTop; Layout.topMargin: Style.marginXS
+              }
+              Flow {
+                Layout.fillWidth: true
+                spacing: Style.marginXS
+                Repeater {
+                  model: (root.rev, root.combosOf(actId))
+                  delegate: Rectangle {
+                    radius: height / 2
+                    color: Color.mSurfaceVariant
+                    border.color: Color.mOutline; border.width: 1
+                    implicitWidth: kbChip.implicitWidth + Style.marginM * 2
+                    implicitHeight: kbChip.implicitHeight + Style.marginXS * 2
+                    RowLayout {
+                      id: kbChip
+                      anchors.centerIn: parent; spacing: Style.marginXS
+                      NText { text: modelData; pointSize: Style.fontSizeS }
+                      NIconButton {
+                        icon: "close"; baseSize: Style.baseWidgetSize * 0.55; tooltipText: "Remove"
+                        onClicked: root.removeCombo(actId, modelData)
+                      }
+                    }
+                  }
+                }
+                NTextInput {
+                  width: 170
+                  placeholderText: "add combo…"
+                  onAccepted: { root.addCombo(actId, text); text = "" }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      NButton {
+        text: "Reset keybinds to defaults"; outlined: true
+        Layout.topMargin: Style.marginM
+        onClicked: root.resetKeybinds()
       }
     }
 

@@ -85,6 +85,35 @@ Hyprland here uses the **Lua / non-legacy config parser** (`~/.config/hypr/hyprl
 - Confirm-or-revert is daemon-enforced (15 s timer in `tick()`): revert re-applies the
   snapshotted `layout_prev_specs`. Safe even if the UI dies.
 
+## Keybinds (plugin-managed, live-registered)
+
+The HyperZone shortcuts are owned by the daemon, editable from the settings **Keybinds** tab,
+not hand-written in hyprland.lua anymore. Config lives in `config.json` under `keybinds`
+(`action-id → ["SUPER + CTRL + left", …]`); `KEYBIND_CMDS`/`DEFAULT_KEYBINDS` in the daemon
+map ids to hzctl invocations and seed the defaults.
+- **Register/unregister LIVE via `eval`** (hl.bind is NOT a dispatcher, so `hbatch`'s
+  `/dispatch` wrapper can't carry it — and `hyprctl dispatch 'hl.bind(...)'` errors on the
+  outer `hl.dispatch`). Use `hypr_request('eval hl.bind("SUPER + CTRL + left",
+  hl.dsp.exec_cmd("…hzctl.py move left"))')` → `ok`. Unbind: `eval hl.unbind("SUPER + CTRL + left")`.
+- Re-binding the same chord **duplicates** (both fire) — to change a bind you must `hl.unbind`
+  then `hl.bind`. `register_keybinds()` diffs desired vs `self.active_binds` and only touches
+  the delta; `initial=True` (startup) unbinds-then-binds every combo to clear any hyprland.lua
+  duplicate still loaded in the running instance.
+- `binds -j` shows Lua-registered binds with a **numeric `arg`** (a Lua callback ref), not the
+  command string — filter by `modmask`/`key`, not by `arg`. modmask: SHIFT=1 CTRL=4 SUPER=64
+  (so SUPER+CTRL=68, SUPER+SHIFT=65, SUPER+CTRL+SHIFT=69).
+- **In-app press-to-capture doesn't work** for bound chords: the compositor grabs them before
+  the focused app sees the keypress. The settings UI uses **typed combos** (normalized) instead.
+- `migrate_keybinds()` comments the hand-written HyperZone *keyboard* binds out of hyprland.lua
+  once (marker `-- hyperzone-managed keybinds`, backup `hyprland.lua.hz-kb-backup`), leaving the
+  **mouse drag-binds** (snap-drop/float-drop) and every non-HyperZone bind alone. Matches the
+  hzctl verb right after `hyperzone .. "`. Runs on stdio startup; the running instance is deduped
+  separately by `register_keybinds(initial=True)`.
+- `push <dir>` (Super+Ctrl+Shift+arrows) = move within the screen, spill to the adjacent monitor
+  at the edge (`cmd_move` now returns whether it moved; `cmd_push` falls through to `cmd_tomon`).
+- `tomon` moves by **monitor name** (`hl.window.move({monitor="DP-1"})`) — moving by x/y does NOT
+  reassign a floating window's output (Hyprland keeps its old monitor membership).
+
 ## Git / push
 
 Remote is HTTPS with no stored creds; SSH keys aren't set up. Push works via the GitHub CLI:

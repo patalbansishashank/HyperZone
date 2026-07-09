@@ -31,6 +31,7 @@ Set HYPERZONE_OFF=1 to disable the daemon entirely.
 """
 import json
 import os
+import re
 import selectors
 import shutil
 import socket
@@ -157,6 +158,58 @@ def compile_layout(layout):
 # definition of the default zone shapes (DEFAULT_LAYOUT above).
 MANAGED = {"HDMI-A-1": compile_layout(DEFAULT_LAYOUT)}
 
+# ── keybinds (plugin-managed, registered live via `eval hl.bind`) ──
+# Each action maps to the hzctl invocation it runs. The daemon binds/unbinds the
+# user's chosen key combos at runtime (register_keybinds), so they are editable
+# from the plugin settings with no hyprland.lua round-trip. A combo is a Hyprland
+# bind string, e.g. "SUPER + CTRL + left". The settings UI edits KEYBINDS via the
+# normal set_config path; defaults below reproduce the hand-written binds that
+# hyprland.lua used to carry (which migrate_keybinds() then comments out).
+HZCTL_CMD = "python3 -S " + os.path.join(
+    os.environ.get("HOME") or os.path.expanduser("~"), ".local", "bin", "hzctl.py")
+KEYBIND_CMDS = {
+    "move-left": "move left", "move-right": "move right",
+    "move-up": "move up", "move-down": "move down",
+    "tomon-left": "tomon left", "tomon-right": "tomon right",
+    "tomon-up": "tomon up", "tomon-down": "tomon down",
+    "push-left": "push left", "push-right": "push right",
+    "push-up": "push up", "push-down": "push down",
+    "toggle-float": "toggle-float", "rearrange": "rearrange", "retile": "retile",
+}
+DEFAULT_KEYBINDS = {
+    "move-left": ["SUPER + CTRL + left", "SUPER + CTRL + H"],
+    "move-right": ["SUPER + CTRL + right", "SUPER + CTRL + L"],
+    "move-up": ["SUPER + CTRL + up", "SUPER + CTRL + K"],
+    "move-down": ["SUPER + CTRL + down", "SUPER + CTRL + J"],
+    "tomon-left": ["SUPER + SHIFT + left"],
+    "tomon-right": ["SUPER + SHIFT + right"],
+    "tomon-up": ["SUPER + SHIFT + up"],
+    "tomon-down": ["SUPER + SHIFT + down"],
+    "push-left": ["SUPER + CTRL + SHIFT + left"],
+    "push-right": ["SUPER + CTRL + SHIFT + right"],
+    "push-up": ["SUPER + CTRL + SHIFT + up"],
+    "push-down": ["SUPER + CTRL + SHIFT + down"],
+    "toggle-float": ["SUPER + T"],
+    "rearrange": ["SUPER + SHIFT + T"],
+    "retile": [],
+}
+KEYBINDS = {k: list(v) for k, v in DEFAULT_KEYBINDS.items()}
+KEYBIND_MARKER = "-- hyperzone-managed keybinds"
+# verbs whose hand-written hyprland.lua binds we take over (mouse drag-binds
+# snap-drop/float-drop are deliberately NOT in this set — they stay in hyprland.lua)
+_KB_VERBS = ("move", "tomon", "push", "toggle-float", "rearrange", "retile")
+
+
+def merge_keybinds(user):
+    """Full keybind map = defaults overlaid with the user's per-action lists, so an
+    action the user never touched keeps its default and one they cleared stays empty."""
+    merged = {k: list(v) for k, v in DEFAULT_KEYBINDS.items()}
+    if isinstance(user, dict):
+        for act, combos in user.items():
+            if act in KEYBIND_CMDS and isinstance(combos, list):
+                merged[act] = [str(c) for c in combos]
+    return merged
+
 
 def _validate_layout(name, layout):
     if not isinstance(layout, dict):
@@ -212,6 +265,15 @@ def validate_config(cfg):
     for k in ("border_float", "border_float_inactive"):
         if k in cfg and not isinstance(cfg[k], str):
             raise ValueError("%s must be a string" % k)
+    if "keybinds" in cfg:
+        kb = cfg["keybinds"]
+        if not isinstance(kb, dict):
+            raise ValueError("keybinds must be an object")
+        for act, combos in kb.items():
+            if act not in KEYBIND_CMDS:
+                raise ValueError("unknown keybind action: %s" % act)
+            if not isinstance(combos, list) or not all(isinstance(c, str) for c in combos):
+                raise ValueError("keybinds.%s must be a list of strings" % act)
 
 
 def apply_config(cfg):
@@ -221,6 +283,7 @@ def apply_config(cfg):
     cells and carries an `enabled` flag reseed() honours."""
     validate_config(cfg)
     global MANAGED, DENY_CLASSES, BORDER_FLOAT, BORDER_FLOAT_INACTIVE, ADOPT_DELAY
+    global KEYBINDS
     if "managed" in cfg:
         managed = {}
         for name, mc in cfg["managed"].items():
@@ -243,6 +306,8 @@ def apply_config(cfg):
         BORDER_FLOAT_INACTIVE = str(cfg["border_float_inactive"])
     if "adopt_delay" in cfg:
         ADOPT_DELAY = float(cfg["adopt_delay"])
+    if "keybinds" in cfg:
+        KEYBINDS = merge_keybinds(cfg["keybinds"])
 
 
 def load_user_config():
@@ -1254,6 +1319,7 @@ class Daemon(HyperZone):
         cfg.setdefault("adopt_delay", ADOPT_DELAY)
         cfg.setdefault("border_float", BORDER_FLOAT)
         cfg.setdefault("border_float_inactive", BORDER_FLOAT_INACTIVE)
+        cfg.setdefault("keybinds", {k: list(v) for k, v in KEYBINDS.items()})
         return cfg
 
     def state_snapshot(self):
@@ -1295,8 +1361,95 @@ class Daemon(HyperZone):
         refresh_gaps()
         self.reseed()
         self.retile(force=True)
+        self.register_keybinds()       # apply any changed key combos live
         self.emit("config_changed", {"config": self.effective_config()})
         return {"config": self.effective_config()}
+
+    # -- keybinds (registered live via Hyprland's Lua `eval`) --
+    def _keybind_expr(self, combo, action):
+        return 'hl.bind("%s", hl.dsp.exec_cmd("%s %s"))' % (
+            combo, HZCTL_CMD, KEYBIND_CMDS[action])
+
+    @staticmethod
+    def _heval(expr):
+        """Run one Lua expression through Hyprland's `eval` (hl.bind/hl.unbind are
+        not dispatchers, so hbatch's /dispatch wrapper can't carry them)."""
+        reply = hypr_request("eval " + expr)
+        if reply is not None and reply.strip() and reply.strip() != "ok":
+            log("keybind eval:", expr[:70], "->", reply.strip())
+
+    @staticmethod
+    def desired_binds():
+        """KEYBINDS flattened to {combo: action}; blanks dropped."""
+        out = {}
+        for action, combos in KEYBINDS.items():
+            for combo in combos:
+                c = combo.strip()
+                if c:
+                    out[c] = action
+        return out
+
+    def register_keybinds(self, initial=False):
+        """Reconcile Hyprland's live binds with KEYBINDS. On `initial` (startup) we
+        unbind every wanted combo first, clearing any duplicate hyprland.lua still
+        registered before we took ownership, then (re)bind ours. Afterwards only the
+        delta is touched, so editing one shortcut doesn't re-register them all."""
+        desired = self.desired_binds()
+        prev = getattr(self, "active_binds", {})
+        for combo, action in prev.items():         # gone, or remapped to a new action
+            if desired.get(combo) != action:
+                self._heval('hl.unbind("%s")' % combo)
+        for combo, action in desired.items():
+            if initial or prev.get(combo) != action:
+                if initial:
+                    self._heval('hl.unbind("%s")' % combo)   # drop hyprland.lua dup
+                self._heval(self._keybind_expr(combo, action))
+        self.active_binds = desired
+
+    def migrate_keybinds(self):
+        """One-time: stop hyprland.lua from ALSO binding the keys we now own (else a
+        press fires twice). Comments out its hand-written HyperZone *keyboard* binds
+        — leaving the mouse drag-binds and every non-HyperZone bind untouched — and
+        keeps a timestamped backup. Idempotent via KEYBIND_MARKER. The already-loaded
+        running instance is deduped separately by register_keybinds(initial=True)."""
+        try:
+            with open(HYPRLAND_LUA) as f:
+                text = f.read()
+        except OSError:
+            return
+        if KEYBIND_MARKER in text:
+            return
+        out, changed = [], False
+        for ln in text.splitlines(keepends=True):
+            if self._is_hz_keyboard_bind(ln):
+                out.append("-- " + ln)
+                changed = True
+            else:
+                out.append(ln)
+        stamp = "%s  (auto-added when HyperZone took over these keybinds)\n" % KEYBIND_MARKER
+        body = stamp + "".join(out)
+        try:
+            if changed:
+                shutil.copy2(HYPRLAND_LUA, HYPRLAND_LUA + ".hz-kb-backup")
+            tmp = HYPRLAND_LUA + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(body)
+            os.replace(tmp, HYPRLAND_LUA)
+            log("keybinds: migrated hyprland.lua (commented %s HyperZone binds)"
+                % sum(1 for l in out if l.startswith("-- hl.bind")))
+        except OSError as e:
+            log("keybinds: hyprland.lua migration failed:", e)
+
+    @staticmethod
+    def _is_hz_keyboard_bind(line):
+        """A hand-written `hl.bind(... hyperzone .. " <verb> ...")` keyboard bind we
+        take over. Matches the hzctl subcommand right after `hyperzone .. "` so mouse
+        binds (snap-drop/float-drop) and unrelated binds are left alone."""
+        s = line.strip()
+        if not s.startswith("hl.bind(") or "hyperzone" not in s or "mouse" in s:
+            return False
+        m = re.search(r'hyperzone\s*\.\.\s*"\s*([a-z-]+)', s)
+        return bool(m) and m.group(1) in _KB_VERBS
 
     def rpc_retile(self, params):
         self.retile(force=True)
@@ -1715,7 +1868,7 @@ class Daemon(HyperZone):
             active = naddr(aw.get("address", "")) if aw else ""
         # args get interpolated into dispatch strings — accept only the fixed
         # vocabulary, so a malformed message can't inject or crash anything.
-        if cmd in ("move", "tomon") and arg not in self.DIRECTIONS:
+        if cmd in ("move", "tomon", "push") and arg not in self.DIRECTIONS:
             log("cmd rejected: bad arg", cmd, repr(arg))
             return
         if active and not (active.startswith("0x")
@@ -1746,6 +1899,8 @@ class Daemon(HyperZone):
             self.cmd_move(active, arg)
         elif cmd == "tomon" and active:
             self.cmd_tomon(active, arg)
+        elif cmd == "push" and active:
+            self.cmd_push(active, arg)
         elif cmd == "toggle-float" and active:
             self.cmd_toggle_float(active)
             self.verify_at = time.time() + VERIFY_AFTER_CMD
@@ -1779,6 +1934,10 @@ class Daemon(HyperZone):
         return False
 
     def cmd_move(self, addr, direction):
+        """Move the focused window one slot in `direction` WITHIN its screen.
+        Returns True if it moved/swapped, False if there was nothing that way (the
+        window is at the screen edge) — cmd_push uses that to decide when to spill
+        over to the next monitor."""
         mon = self.mon_of_addr(addr)
         if not mon:
             # Unmanaged window: swap with the neighbour in `direction` ONLY if it's
@@ -1787,13 +1946,14 @@ class Daemon(HyperZone):
             # Super+Ctrl behave like it does on the managed screen: never leaves.
             if self._same_mon_neighbour(addr, direction):
                 hbatch(['hl.dsp.window.swap({direction="%s"})' % direction])
-            return
+                return True
+            return False
         # Find the nearest target in `direction`. Targets are BOTH occupied tiles
         # (swap with them) and EMPTY zones (move into them, so you can rearrange
         # even when fewer than 4 windows are open).
         me = mon.leaf_of(addr)
         if not me:
-            return
+            return False
         my_zi, my_leaf, (mx, my, mw, mh) = me
         mc = (mx + mw / 2, my + mh / 2)
         best = None                          # (dist, kind, payload)
@@ -1814,13 +1974,22 @@ class Daemon(HyperZone):
                     if best is None or d < best[0]:
                         best = (d, "into", zi)
         if best is None:
-            return  # nothing in that direction: stay put
+            return False  # nothing in that direction: at the edge, stay put
         if best[1] == "swap":
             my_leaf["win"], best[2]["win"] = best[2]["win"], my_leaf["win"]
         else:                                   # move into the empty zone (whole)
             mon.trees[my_zi] = remove_win(mon.trees[my_zi], addr)
             mon.trees[best[2]] = leaf(addr)
         self.apply(mon)
+        return True
+
+    def cmd_push(self, addr, direction):
+        """Unified 'move it that way, across everything': shove the window one slot
+        in `direction` within the screen, and if it's already at that edge, send it
+        to the adjacent monitor instead. One keybind that flows a window across the
+        whole desk (in-screen rearrange + cross-screen handoff)."""
+        if not self.cmd_move(addr, direction):
+            self.cmd_tomon(addr, direction)
 
     def cmd_toggle_float(self, addr):
         mon = self.mon_of_addr(addr)
@@ -2066,6 +2235,10 @@ class Daemon(HyperZone):
             os.set_blocking(0, False)
             self.sel.register(0, selectors.EVENT_READ, ("rpc", b""))
             self.emit("ready", self.state_snapshot())
+            # take ownership of the HyperZone keybinds: comment the hand-written
+            # ones out of hyprland.lua (once) and register the configured set live.
+            self.migrate_keybinds()
+            self.register_keybinds(initial=True)
         log("daemon up; managing", list(self.mons), "stdio" if stdio else "")
         while not self.stop:
             for key, _ in self.sel.select(self.next_timeout()):
@@ -2147,7 +2320,7 @@ def cli_fallback(cmd, arg):
         hbatch(['hl.dsp.window.float({action="toggle"})'])
 
 
-COMMANDS = ("daemon", "move", "tomon", "toggle-float", "snap-drop",
+COMMANDS = ("daemon", "move", "tomon", "push", "toggle-float", "snap-drop",
             "float-drop", "retile", "rearrange", "dump")
 
 
