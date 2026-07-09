@@ -36,7 +36,6 @@ by re-skinning only. The daemon is the single writer of its config file.
 | `hzctl.py`     | fast keybind client (Hyprland binds call this)               |
 | `manifest.json`| Noctalia plugin manifest                                     |
 | `install.sh`   | copy-install into `~/.config/noctalia/plugins/hyperzone`     |
-| `deploy.sh`    | standalone/dev deploy of the bare daemon (not the plugin)    |
 
 ## Install
 

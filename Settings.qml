@@ -62,7 +62,8 @@ ColumnLayout {
   readonly property var zoneNames: ["Blue", "Green", "Orange", "Red"]
   readonly property var zoneEmojis: ["🟦", "🟩", "🟧", "🟥"]
   readonly property var zoneHexes: ["#4c8dff", "#3fc16a", "#f59234", "#ef5350"]
-  function zoneColor(zi) { return root.zoneHexes[zi] || "#888888" }
+  // #AARRGGBB translucent body tints (alpha 0x38 ≈ 22%) for the zone preview.
+  readonly property var zoneFills: ["#384c8dff", "#383fc16a", "#38f59234", "#38ef5350"]
   function zoneLabel(zones, zi) { return (root.zoneEmojis[zi] || "") + " " + (root.zoneNames[zi] || ("Zone " + (zi + 1))) }
 
   function setEnabled(name, on) { monEntry(name).enabled = on; rev++; apply() }
@@ -142,7 +143,7 @@ ColumnLayout {
   function displaysDirty() { return JSON.stringify(dispSpecs()) !== dispBaseline }
   function applyDisplays() {
     if (!hz) return
-    hz.request("apply_monitor_layout", { timeout_s: 15, monitors: dispSpecs() },
+    hz.request("apply_monitor_layout", { monitors: dispSpecs() },   // daemon default timeout
                function (r, e) { if (e) ToastService.showError("HyperZone", "Display apply failed: " + e) })
   }
 
@@ -421,12 +422,9 @@ ColumnLayout {
     property var subdivide: []
     signal splitChanged(real v, real h)
 
-    // Same fixed zone palette as the reorder list (zi → colour). zoneFill is the
-    // #AARRGGBB translucent tint (alpha 0x38 ≈ 22%) for the zone body.
-    readonly property var zoneHex: ["#4c8dff", "#3fc16a", "#f59234", "#ef5350"]
-    readonly property var zoneFill: ["#384c8dff", "#383fc16a", "#38f59234", "#38ef5350"]
-    function zc(zi) { return ze.zoneHex[zi] || Color.mOutline }
-    function zf(zi) { return ze.zoneFill[zi] || Color.mSurfaceVariant }
+    // Zone colours come from the single palette on root (same file scope).
+    function zc(zi) { return root.zoneHexes[zi] || Color.mOutline }
+    function zf(zi) { return root.zoneFills[zi] || Color.mSurfaceVariant }
 
     // live drag state (owned here so dragging is smooth; resynced when props change)
     property real _v: vsplit

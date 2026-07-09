@@ -48,10 +48,9 @@ def main():
         return
     except OSError:
         pass  # daemon down -> best-effort native fallback
+    # (tomon has no fallback: this Hyprland's window.move takes no monitor target)
     if cmd == "move":
         dispatch('hl.dsp.window.move({direction="%s"})' % arg)
-    elif cmd == "tomon":
-        dispatch('hl.dsp.window.move({monitor="%s"})' % arg[0])
     elif cmd == "toggle-float":
         dispatch('hl.dsp.window.float({action="toggle"})')
 

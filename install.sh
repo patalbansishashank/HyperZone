@@ -43,7 +43,7 @@ if [[ "$LINK" == 1 ]]; then
 else
   mkdir -p "$PLUGIN_DIR"
   # copy the plugin payload (skip dev/build cruft); keep settings.json (user data)
-  for item in manifest.json Main.qml Settings.qml hyperzone.py README.md components i18n; do
+  for item in manifest.json Main.qml Settings.qml hyperzone.py README.md; do
     [[ -e "$SRC/$item" ]] && cp -r "$SRC/$item" "$PLUGIN_DIR/"
   done
   echo "✓ copied plugin -> $PLUGIN_DIR"

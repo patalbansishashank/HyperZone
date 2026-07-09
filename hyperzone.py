@@ -72,24 +72,15 @@ DENY_CLASSES = {"pavucontrol", "org.pulseaudio.pavucontrol", "blueman-manager",
 # Each cell is a monitor-relative design-space rect (x, y, w, h).
 #
 #   +-----------+-----------------------+           whole:        split:
-#   | Zone 1    |  Zone 2 (whole 2560)  |   Zone 2  [   one   ]  [ L | R ]
+#   | Zone 1    |  Zone 2 (whole)       |   Zone 2  [   one   ]  [ L | R ]
 #   +-----------+-----------------------+   Zone 3  [  one  ]    [ top   ]
 #   | Zone 3    |                       |           [       ]    [ bot   ]
 #   +-----------+   Zone 4 (big work    |
 #   |           |       area)           |
 #   +-----------+-----------------------+
-MANAGED = {
-    "HDMI-A-1": {
-        "cells": [
-            (1280, 720, 2560, 1440),   # 0 Zone 4 (big work area)
-            (0,    720, 1280, 1440),   # 1 Zone 3 (tall)
-            (1280, 0,   2560, 720),    # 2 Zone 2 (wide)
-            (0,    0,   1280, 720),    # 3 Zone 1
-        ],
-        "fill": [0, 1, 2, 3],   # whole-zone fill order:  Zone4, Zone3, Zone2, Zone1
-        "nice": [2, 1],         # after whole-fill, split these to two:  Zone2, Zone3
-    },
-}
+# MANAGED (the zero-config default) is derived from DEFAULT_LAYOUT below, after
+# compile_layout is defined — one source of truth for the built-in zone shapes.
+MANAGED = {}
 
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
 HIS = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
@@ -115,6 +106,25 @@ DEFAULT_LAYOUT = {"zones": 4, "vsplit": 1.0 / 3, "hsplit": 1.0 / 3,
                   "fill": [3, 2, 1, 0], "subdivide": [1, 2]}
 LAYOUT_D = 10000        # design-space edge for compiled cells (zone_usable rescales)
 
+SPLIT_MIN, SPLIT_MAX = 0.05, 0.95   # divider clamp (mirrored in Settings.qml setV/setH)
+
+# ── tuning constants (seconds unless noted) ──
+# Verify passes re-read settled window geometry to correct drift / learn sizes.
+VERIFY_AFTER_CMD = 0.45      # settle re-check after a user command
+VERIFY_AFTER_RELOAD = 1.0    # bars re-create late after a reconfigure; re-check insets
+VERIFY_CHASE_DELAY = 0.15    # re-read cadence while a window is still settling
+VERIFY_CHASE_MAX = 4         # bounded settle-chase iterations
+FLUSH_VERIFY_DELAY = 0.12    # first verify after a geometry flush
+DRIFT_PX = 4                 # size/pos mismatch at or below this is "settled"
+DIR_MARGIN_PX = 10           # dead-band when deciding a directional neighbour
+SETTLE_READ_DELAY = 0.5      # Hyprland reports new monitor state ~0.4s after an eval
+LEARN_SUPPRESS_APPLY = 3.0   # no minsize learning around a display apply/revert
+LEARN_SUPPRESS_RESEED = 2.5  # ... or around a reseed/config reload
+REVERT_TIMEOUT = 15.0        # confirm-or-revert deadline for display changes
+REARRANGE_DEBOUNCE = 0.3     # ignore rearrange key-repeats inside this window
+FS_INSIST_WINDOW = 1.5       # re-fullscreen within this = app insists; stop fighting
+MON_CACHE_TTL = 1.0          # monitors-list micro-cache (also event-invalidated)
+
 
 def _clampf(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
@@ -128,16 +138,22 @@ def compile_layout(layout):
     index the canonical cells; `subdivide` becomes `nice` (zones that split to two)."""
     D = LAYOUT_D
     zones = int(layout.get("zones", 4))
-    vx = round(_clampf(float(layout.get("vsplit", 1.0 / 3)), 0.05, 0.95) * D)
+    vx = round(_clampf(float(layout.get("vsplit", 1.0 / 3)), SPLIT_MIN, SPLIT_MAX) * D)
     if zones == 2:
         cells = [(0, 0, vx, D), (vx, 0, D - vx, D)]
     else:
-        hy = round(_clampf(float(layout.get("hsplit", 1.0 / 3)), 0.05, 0.95) * D)
+        hy = round(_clampf(float(layout.get("hsplit", 1.0 / 3)), SPLIT_MIN, SPLIT_MAX) * D)
         cells = [(0, 0, vx, hy), (vx, 0, D - vx, hy),
                  (0, hy, vx, D - hy), (vx, hy, D - vx, D - hy)]
     fill = [int(i) for i in layout.get("fill", range(zones))]
     nice = [int(i) for i in layout.get("subdivide", [])]
     return {"cells": cells, "fill": fill, "nice": nice}
+
+
+# Built-in default when no config.json exists: manage HDMI-A-1 with the standard
+# four-zone layout. Same compile path as user configs, so there is exactly one
+# definition of the default zone shapes (DEFAULT_LAYOUT above).
+MANAGED = {"HDMI-A-1": compile_layout(DEFAULT_LAYOUT)}
 
 
 def _validate_layout(name, layout):
@@ -325,20 +341,34 @@ def migrate_lua_text(text):
     return "\n".join(out), n
 
 
-LOG_MAX = 1_000_000   # bytes; the log lives on tmpfs (RAM), so cap it
+LOG_MAX = 1_000_000     # bytes; the log lives on tmpfs (RAM), so cap it
+LOG_CHECK_EVERY = 100   # rotation-size stat once per N lines, not per line
+DEBUG = os.environ.get("HYPERZONE_DEBUG", "") == "1"   # per-action trace logging
+_log_since_check = 0
 
 
 def log(*a):
+    global _log_since_check
     try:
-        try:
-            if os.path.getsize(LOG_PATH) > LOG_MAX:
-                os.replace(LOG_PATH, LOG_PATH + ".1")   # keep one generation
-        except OSError:
-            pass
+        _log_since_check += 1
+        if _log_since_check >= LOG_CHECK_EVERY:
+            _log_since_check = 0
+            try:
+                if os.path.getsize(LOG_PATH) > LOG_MAX:
+                    os.replace(LOG_PATH, LOG_PATH + ".1")   # keep one generation
+            except OSError:
+                pass
         with open(LOG_PATH, "a") as f:
             f.write("%.3f " % time.time() + " ".join(str(x) for x in a) + "\n")
     except OSError:
         pass
+
+
+def dlog(*a):
+    """Per-action trace (every place/remove/apply/keybind). Off by default —
+    it's pure noise in normal operation; set HYPERZONE_DEBUG=1 to enable."""
+    if DEBUG:
+        log(*a)
 
 
 # ───────────────────────── hyprland IPC ─────────────────────────
@@ -408,6 +438,27 @@ def naddr(a):
     if not a:
         return a
     return a if a.startswith("0x") else "0x" + a
+
+
+def float_geom_exprs(addr, w, h, x, y):
+    """The float→resize→move dispatch triple that pins a window to an exact rect.
+    Order matters: float first (resize/move act on the floating window), resize
+    before move (resize is centre-anchored; the final move sets the top-left)."""
+    sel = "address:" + addr
+    return ['hl.dsp.window.float({action="enable", window="%s"})' % sel,
+            'hl.dsp.window.resize({x=%d,y=%d, window="%s"})' % (w, h, sel),
+            'hl.dsp.window.move({x=%d,y=%d, window="%s"})' % (x, y, sel)]
+
+
+def logical_rect(m):
+    """(x, y, w, h) of a live monitor record in LOGICAL pixels: physical size
+    divided by scale, sides swapped when rotated 90°/270°. The one place this
+    transform is defined (Monitor.update and cmd_tomon both build on it)."""
+    w = m.get("width", 0) / float(m.get("scale") or 1)
+    h = m.get("height", 0) / float(m.get("scale") or 1)
+    if int(m.get("transform", 0)) % 2:
+        w, h = h, w
+    return m.get("x", 0), m.get("y", 0), w, h
 
 
 def _atomic_write(path, content):
@@ -588,13 +639,8 @@ class Monitor:
         layout coordinates are logical (physical / scale, sides swapped when
         rotated) — using the design-space size here instead would silently
         misplace every zone on a scaled or rotated monitor."""
-        self.ox, self.oy = info["x"], info["y"]
-        scale = info.get("scale") or 1.0
-        lw = round(info.get("width", self.sw) / scale)
-        lh = round(info.get("height", self.sh) / scale)
-        if info.get("transform", 0) % 2:      # 90°/270° (+flipped): sides swap
-            lw, lh = lh, lw
-        self.lw, self.lh = lw, lh
+        self.ox, self.oy, lw, lh = logical_rect(info)
+        self.lw, self.lh = round(lw), round(lh)
         # Hyprland reserved = [left, top, right, bottom] (exclusive-zone insets).
         self.reserved = info.get("reserved", [0, 0, 0, 0])
 
@@ -664,6 +710,7 @@ class HyperZone:
         self._last_size = {}        # addr -> size at the previous verify read; a size
                                     # must repeat (stable) before we learn from it
         self._apply_count = 0       # geometry passes done (log/diagnostics only)
+        self._mon_cache = (0.0, None)   # (fetched_at, monitors list) micro-cache
         self.reseed()
 
     def want_size(self, cls, rw, rh):
@@ -690,8 +737,24 @@ class HyperZone:
             self.painted.discard(addr)
 
     # -- monitor discovery --
+    def monitors_cached(self):
+        """The live monitors list, memoised for MON_CACHE_TTL. Every window event
+        needs this list (managed_monitor_for, apply); it only actually changes on
+        hotplug / config reload / our own display applies — all of which call
+        invalidate_monitors() — so the TTL is just a safety net."""
+        now = time.time()
+        t, data = self._mon_cache
+        if data is None or now - t > MON_CACHE_TTL:
+            data = hjson("monitors") or []
+            self._mon_cache = (now, data)
+        return data
+
+    def invalidate_monitors(self):
+        self._mon_cache = (0.0, None)
+
     def reseed(self):
-        info = {m["name"]: m for m in (hjson("monitors") or [])}
+        self.invalidate_monitors()
+        info = {m["name"]: m for m in self.monitors_cached()}
         # keep existing slot occupants where the monitor still exists
         old = self.mons
         self.mons = {}
@@ -701,8 +764,7 @@ class HyperZone:
                 if name in old and len(old[name].trees) == len(mon.trees):
                     mon.trees = old[name].trees     # preserve layout on reseed
                 self.mons[name] = mon
-
-        log("reseed managed:", list(self.mons))
+        dlog("reseed managed:", list(self.mons))
 
     def mon_of_addr(self, addr):
         for mon in self.mons.values():
@@ -721,9 +783,8 @@ class HyperZone:
         """Return the Monitor a client should be managed on, or None."""
         if not client:
             return None
-        mons = hjson("monitors") or []
         mid = client.get("monitor")
-        name = next((m["name"] for m in mons if m["id"] == mid), None)
+        name = next((m["name"] for m in self.monitors_cached() if m["id"] == mid), None)
         return self.mons.get(name)
 
     def is_popup(self, client):
@@ -772,7 +833,7 @@ class HyperZone:
         for zi in mon.fill:
             if mon.trees[zi] is None:
                 mon.trees[zi] = leaf(addr)
-                log("place", addr, "-> zone", zi + 1, "whole", mon.name)
+                dlog("place", addr, "-> zone", zi + 1, "whole", mon.name)
                 self.apply(mon)
                 return
         # 2) nice split: Zone 2 then Zone 3 to a second window
@@ -780,7 +841,7 @@ class HyperZone:
             if count_leaves(mon.trees[zi]) < 2:
                 lf, rect = next(walk(mon.trees[zi], mon.zone_rect(zi)))
                 split_leaf(lf, addr, rect, new_first=self._new_first(mon, rect))
-                log("place", addr, "-> zone", zi + 1, "split", mon.name)
+                dlog("place", addr, "-> zone", zi + 1, "split", mon.name)
                 self.apply(mon)
                 return
         # 3) overflow: subdivide the focused window (Hyprland-style dwindle)
@@ -808,7 +869,7 @@ class HyperZone:
             return
         zi, lf, rect = tgt
         split_leaf(lf, addr, rect, new_first=self._new_first(mon, rect))
-        log("place", addr, "-> overflow split zone", zi + 1, mon.name)
+        dlog("place", addr, "-> overflow split zone", zi + 1, mon.name)
         self.apply(mon)
 
     def focused_leaf(self, mon):
@@ -867,7 +928,7 @@ class HyperZone:
                 cw, ch = c.get("size", [tw, th])         # what the app settled at
                 cx, cy = c.get("at", [gx, gy])
                 seen[addr] = (cw, ch)
-                mismatch = abs(cw - tw) > 4 or abs(ch - th) > 4
+                mismatch = abs(cw - tw) > DRIFT_PX or abs(ch - th) > DRIFT_PX
                 # LEARN the app's true minimum from the settled size, per class:
                 #  - settled BIGGER than commanded -> its min is higher than we knew
                 #  - settled SMALLER than a clamp we applied -> our record was too
@@ -881,17 +942,17 @@ class HyperZone:
                 if mismatch and stable and time.time() >= self.learn_suppress_until:
                     ms = self.minsize.setdefault(cls, [0, 0])
                     for i, (got, want, zone) in enumerate(((cw, tw, rw), (ch, th, rh))):
-                        if got - want > 4 and got > ms[i]:
+                        if got - want > DRIFT_PX and got > ms[i]:
                             ms[i] = int(got); learned = True
-                        elif want > zone and want - got > 4:   # our clamp overshot
-                            ms[i] = int(got) if got > zone + 4 else 0
+                        elif want > zone and want - got > DRIFT_PX:   # our clamp overshot
+                            ms[i] = int(got) if got > zone + DRIFT_PX else 0
                             learned = True
                     if ms == [0, 0]:
                         self.minsize.pop(cls, None)
                 # Re-anchor: pin the top-left back to the zone corner if the app's
                 # commit pushed it off (centre-anchored re-position). Once its size
                 # is learned we command the right size up front and this stops firing.
-                if abs(cx - gx) > 4 or abs(cy - gy) > 4:
+                if abs(cx - gx) > DRIFT_PX or abs(cy - gy) > DRIFT_PX:
                     reanchor.append('hl.dsp.window.move({x=%d,y=%d, window="address:%s"})'
                                     % (gx, gy, addr))
         self._last_size = seen
@@ -899,13 +960,13 @@ class HyperZone:
             log("minsize learned:", dict(self.minsize))
             self.save()
         if reanchor:
-            log("verify re-anchor", len(reanchor), "chase", self._verify_chase)
+            dlog("verify re-anchor", len(reanchor), "chase", self._verify_chase)
             hbatch(reanchor)
-        if (reanchor or unsettled) and self._verify_chase < 4:
+        if (reanchor or unsettled) and self._verify_chase < VERIFY_CHASE_MAX:
             # not settled yet -> read again shortly (bounded). Once sizes are
             # learned, applies are exact first-pass and this never runs.
             self._verify_chase += 1
-            self.verify_at = time.time() + 0.15
+            self.verify_at = time.time() + VERIFY_CHASE_DELAY
         elif not reanchor and not unsettled:
             self._verify_chase = 0
 
@@ -933,7 +994,7 @@ class HyperZone:
         for zi in range(len(mon.trees)):
             if mon.trees[zi] is not None:
                 mon.trees[zi] = remove_win(mon.trees[zi], addr)
-        log("remove", addr, mon.name)
+        dlog("remove", addr, mon.name)
         self.apply(mon)
         return True
 
@@ -962,42 +1023,39 @@ class HyperZone:
             # this change must not count as "stable" for learning.
             self._verify_chase = 0
             self._last_size = {}
-            due = time.time() + 0.12
+            due = time.time() + FLUSH_VERIFY_DELAY
             if self.verify_at is None or due < self.verify_at:
                 self.verify_at = due
 
     def _apply_now(self, mon):
         self._apply_count += 1
-        log("APPLY#", self._apply_count, mon.name)
+        dlog("APPLY#", self._apply_count, mon.name)
         # refresh offset + reserved bar space so layout tracks the live bar
-        info = next((m for m in (hjson("monitors") or []) if m["name"] == mon.name), None)
+        info = next((m for m in self.monitors_cached() if m["name"] == mon.name), None)
         if info:
             mon.update(info)
         # live client map so we can un-fullscreen anything we're about to tile
         # (a stuck-fullscreen window otherwise falls back to a broken float size).
         clients = {c["address"]: c for c in (hjson("clients") or [])}
-        exprs = []
+        exprs, repaint = [], []
         for zi, lf, (rx, ry, rw, rh) in mon.leaves():
             addr = lf["win"]
             gx, gy = mon.ox + rx, mon.oy + ry
-            sel = "address:" + addr
             c = clients.get(addr)
             if c and c.get("fullscreen"):
                 # same batch = atomic: leave fullscreen, THEN size/place it.
-                exprs.append('hl.dsp.window.fullscreen({action="unset", window="%s"})' % sel)
+                exprs.append('hl.dsp.window.fullscreen({action="unset", window="address:%s"})' % addr)
                 self.suspended.pop(addr, None)
                 self.unfs_at[addr] = time.time()   # for fullscreen-insist guard
             # command the size the app will actually settle at (zone raised to its
             # learned min) so its async clamp can't re-commit and bump the window
             tw, th = self.want_size((c or {}).get("class"), rw, rh)
-            exprs.append('hl.dsp.window.float({action="enable", window="%s"})' % sel)
-            exprs.append('hl.dsp.window.resize({x=%d,y=%d, window="%s"})' % (tw, th, sel))
-            exprs.append('hl.dsp.window.move({x=%d,y=%d, window="%s"})' % (gx, gy, sel))
+            exprs += float_geom_exprs(addr, tw, th, gx, gy)
+            if addr in self.painted:   # tiled again -> back to the config colour
+                repaint.append(addr)
         hbatch(exprs)
-        # any managed window we'd painted amber goes back to the config colour
-        for zi, lf, _ in mon.leaves():
-            if lf["win"] in self.painted:
-                self.paint(lf["win"], False)
+        for addr in repaint:
+            self.paint(addr, False)
         self.save()
 
     # -- persistence (survives a daemon restart within the same session) --
@@ -1082,7 +1140,7 @@ class HyperZone:
                 self.place(addr, mon)
         for mon in self.mons.values():
             self.apply(mon)
-        log("retile done force=%s" % force)
+        dlog("retile done force=%s" % force)
 
 
 # ───────────────────────── directional navigation ─────────────────────────
@@ -1096,13 +1154,13 @@ def _in_direction(direction, mc, oc, msize, osize):
     overlap_x = abs(ocx - mcx) < (mw + ow) / 2
     overlap_y = abs(ocy - mcy) < (mh + oh) / 2
     if direction == "left":
-        return ocx < mcx - 10 and overlap_y
+        return ocx < mcx - DIR_MARGIN_PX and overlap_y
     if direction == "right":
-        return ocx > mcx + 10 and overlap_y
+        return ocx > mcx + DIR_MARGIN_PX and overlap_y
     if direction == "up":
-        return ocy < mcy - 10 and overlap_x
+        return ocy < mcy - DIR_MARGIN_PX and overlap_x
     if direction == "down":
-        return ocy > mcy + 10 and overlap_x
+        return ocy > mcy + DIR_MARGIN_PX and overlap_x
     return False
 
 
@@ -1267,6 +1325,7 @@ class Daemon(HyperZone):
             reply = hypr_request("eval " + lua_monitor(spec))
             if reply is not None and reply.strip() and reply.strip() != "ok":
                 log("monitor eval:", spec.get("name"), "->", reply.strip())
+        self.invalidate_monitors()   # geometry just changed under the cache
 
     def rpc_apply_monitor_layout(self, params):
         """Reconfigure displays LIVE (Lua `eval`), then arm a daemon-enforced revert:
@@ -1306,16 +1365,16 @@ class Daemon(HyperZone):
         if migrated and os.path.exists(MONITORS_LUA):
             shutil.copyfile(MONITORS_LUA, MONITORS_LUA + ".pending-backup")
         self._apply_live_specs(specs)                       # <- takes effect now
-        self.learn_suppress_until = time.time() + 3.0       # windows are in flux
+        self.learn_suppress_until = time.time() + LEARN_SUPPRESS_APPLY       # windows are in flux
         if migrated:
             _atomic_write(MONITORS_LUA, generate_monitors_lua(specs))
-        timeout_s = float(params.get("timeout_s", 15))
+        timeout_s = float(params.get("timeout_s", REVERT_TIMEOUT))
         self.layout_revert_at = time.time() + timeout_s
         # Hyprland reports the new mode/scale/transform a beat AFTER the eval
         # (measured ~0.4s); a synchronous live_monitors() read is stale and would
         # bounce the UI's preview back to the old value. Defer the state push to a
         # settled read in tick().
-        self.monitors_refresh_at = time.time() + 0.5
+        self.monitors_refresh_at = time.time() + SETTLE_READ_DELAY
         self.emit("layout_pending", self.pending_layout_info())
         return {"deadline": self.layout_revert_at, "persisted": migrated}
 
@@ -1349,7 +1408,7 @@ class Daemon(HyperZone):
         if prev:
             try:
                 self._apply_live_specs(prev)                # restore the actual display state
-                self.learn_suppress_until = time.time() + 3.0
+                self.learn_suppress_until = time.time() + LEARN_SUPPRESS_APPLY
             except Exception as e:
                 log("revert live-apply error", e)
         bak = MONITORS_LUA + ".pending-backup"
@@ -1359,7 +1418,7 @@ class Daemon(HyperZone):
         except OSError as e:
             log("revert_layout file error", e)
         log("display layout reverted:", reason)
-        self.monitors_refresh_at = time.time() + 0.5   # settled read (see apply)
+        self.monitors_refresh_at = time.time() + SETTLE_READ_DELAY   # settled read (see apply)
         self.emit("layout_reverted", {"reason": reason})
 
     def rpc_migrate_hyprland_config(self, params):
@@ -1441,9 +1500,9 @@ class Daemon(HyperZone):
                     self.apply(mon)
                 # Noctalia re-creates its bar a beat after a reconfigure, changing
                 # the reserved insets; a second pass then re-anchors to the new area.
-                self.verify_at = time.time() + 1.0
+                self.verify_at = time.time() + VERIFY_AFTER_RELOAD
                 self.learn_suppress_until = max(self.learn_suppress_until,
-                                                time.time() + 2.5)
+                                                time.time() + LEARN_SUPPRESS_RESEED)
                 self.emit("monitors_changed", {"monitors": self.live_monitors()})
         except Exception as e:
             log("on_event error", repr(line), e)
@@ -1472,8 +1531,8 @@ class Daemon(HyperZone):
             self.reseed()
             for mon in self.mons.values():
                 self.apply(mon)
-            self.verify_at = now + 1.0   # bars re-anchor late; re-check insets
-            self.learn_suppress_until = max(self.learn_suppress_until, now + 2.5)
+            self.verify_at = now + VERIFY_AFTER_RELOAD   # bars re-anchor late; re-check insets
+            self.learn_suppress_until = max(self.learn_suppress_until, now + LEARN_SUPPRESS_RESEED)
             self.emit("monitors_changed", {"monitors": self.live_monitors()})
         self.flush()                 # single coalesced geometry pass
 
@@ -1554,7 +1613,7 @@ class Daemon(HyperZone):
                 if lf["win"] in fs:
                     a = lf["win"]
                     self.remove(a, mon)
-                    if time.time() - self.unfs_at.get(a, 0) < 1.5:
+                    if time.time() - self.unfs_at.get(a, 0) < FS_INSIST_WINDOW:
                         # it re-fullscreened right after WE cleared it: a wedged
                         # app that insists on fullscreen. Stop fighting it — leave
                         # it alone (don't restore) so it can't ping-pong forever.
@@ -1592,7 +1651,7 @@ class Daemon(HyperZone):
                            and all(ch in "0123456789abcdef" for ch in active[2:].lower())):
             log("cmd rejected: bad address", repr(active))
             return
-        log("cmd", cmd, arg, active)
+        dlog("cmd", cmd, arg, active)
         if cmd == "shutdown":                # a takeover daemon asked us to stand down
             self.stop = True
             return
@@ -1603,12 +1662,12 @@ class Daemon(HyperZone):
             # debounce: rearrange is idempotent, so ignore key-repeat bursts that
             # would otherwise each re-tile the whole screen (the freeze trigger).
             now = time.time()
-            if now - self.last_rearrange < 0.3:
-                log("rearrange debounced")
+            if now - self.last_rearrange < REARRANGE_DEBOUNCE:
+                dlog("rearrange debounced")
             else:
                 self.last_rearrange = now
                 self.retile(force=True)  # hard reset: re-tile everything
-                self.verify_at = now + 0.45
+                self.verify_at = now + VERIFY_AFTER_CMD
         elif cmd == "dump":
             for mon in self.mons.values():
                 log("STATE", mon.name, mon.dump(), "detached", self.detached)
@@ -1618,10 +1677,10 @@ class Daemon(HyperZone):
             self.cmd_tomon(active, arg)
         elif cmd == "toggle-float" and active:
             self.cmd_toggle_float(active)
-            self.verify_at = time.time() + 0.45
+            self.verify_at = time.time() + VERIFY_AFTER_CMD
         elif cmd == "snap-drop" and active:
             self.cmd_snap_drop(active)     # dropped on managed -> snap to cursor zone
-            self.verify_at = time.time() + 0.45
+            self.verify_at = time.time() + VERIFY_AFTER_CMD
         elif cmd == "float-drop" and active:
             self.cmd_float_drop(active)     # dropped with float modifier -> leave loose
 
@@ -1694,7 +1753,7 @@ class Daemon(HyperZone):
 
     def cmd_toggle_float(self, addr):
         mon = self.mon_of_addr(addr)
-        log("toggle-float", addr, "mon=", mon.name if mon else None,
+        dlog("toggle-float", addr, "mon=", mon.name if mon else None,
             "detached?", addr in self.detached)
         if mon:                       # managed -> detach to free float
             self.remove(addr, mon)
@@ -1730,11 +1789,8 @@ class Daemon(HyperZone):
                 # no size jump, no shift), which also rewrites Hyprland's float
                 # memory to a sane value. One-shot.
                 self.was_managed.discard(addr)
-                hbatch(['hl.dsp.window.float({action="enable", window="address:%s"})' % addr,
-                        'hl.dsp.window.resize({x=%d,y=%d, window="address:%s"})'
-                        % (int(sz[0]), int(sz[1]), addr),
-                        'hl.dsp.window.move({x=%d,y=%d, window="address:%s"})'
-                        % (int(at[0]), int(at[1]), addr)])
+                hbatch(float_geom_exprs(addr, int(sz[0]), int(sz[1]),
+                                        int(at[0]), int(at[1])))
                 self.paint(addr, True)   # amber: now free-floating
                 self.save()              # persist the consumed flag
             else:
@@ -1769,28 +1825,20 @@ class Daemon(HyperZone):
         silently no-ops for an addressed window; both verified live). So teleport
         by absolute x/y into the target monitor; the movewindowv2 that follows
         makes the daemon re-adopt (managed) or dock it natively (unmanaged)."""
-        mons = hjson("monitors") or []
+        mons = self.monitors_cached()
         c = self.client(addr)
         if not c or not mons:
             return
-
-        def rect(m):   # logical rect (scale + rotation aware)
-            w = m["width"] / float(m.get("scale") or 1)
-            h = m["height"] / float(m.get("scale") or 1)
-            if int(m.get("transform", 0)) % 2:
-                w, h = h, w
-            return m["x"], m["y"], w, h
-
         cur = next((m for m in mons if m.get("id") == c.get("monitor")), None)
         if not cur:
             return
-        cx, cy, cw, ch = rect(cur)
+        cx, cy, cw, ch = logical_rect(cur)
         ccx, ccy = cx + cw / 2, cy + ch / 2
         best = None
         for m in mons:
             if m.get("id") == cur.get("id") or m.get("disabled"):
                 continue
-            x, y, w, h = rect(m)
+            x, y, w, h = logical_rect(m)
             dx, dy = (x + w / 2) - ccx, (y + h / 2) - ccy
             hit = {"left": dx < 0 and abs(dx) >= abs(dy),
                    "right": dx > 0 and abs(dx) >= abs(dy),
@@ -1882,22 +1930,20 @@ class Daemon(HyperZone):
         return True
 
     # -- main loop --
-    def run(self, stdio=False):
-        self.stdio = stdio
-        if stdio:
-            # Repurpose stdout as the RPC channel: dup the real fd 1 to a private
-            # handle, then point fd 1 at /dev/null so NOTHING — stray prints, C
-            # libraries, child processes inheriting fd 1 — can ever corrupt the
-            # stream. Do this FIRST, before any other code runs. stderr is left
-            # alone (tracebacks/logs flow to the plugin's logger).
-            self.rpc_out = os.fdopen(os.dup(1), "w", buffering=1)
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, 1)
-            os.close(devnull)
-        if not self._acquire_control_socket():
-            return
-        # event socket — retry briefly: when autostarted from the Hyprland config
-        # the compositor may not be listening yet on the very first attempt.
+    def _harden_stdio(self):
+        """Repurpose stdout as the RPC channel: dup the real fd 1 to a private
+        handle, then point fd 1 at /dev/null so NOTHING — stray prints, C
+        libraries, child processes inheriting fd 1 — can ever corrupt the
+        stream. Must run FIRST, before any other code. stderr is left alone
+        (tracebacks/logs flow to the plugin's logger)."""
+        self.rpc_out = os.fdopen(os.dup(1), "w", buffering=1)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        os.close(devnull)
+
+    def _connect_event_socket(self):
+        """Connect to socket2 — retry briefly: when autostarted from the Hyprland
+        config the compositor may not be listening yet on the first attempt."""
         ev = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         for attempt in range(20):
             try:
@@ -1911,7 +1957,9 @@ class Daemon(HyperZone):
                 time.sleep(0.25)
         ev.setblocking(False)
         self.sel.register(ev, selectors.EVENT_READ, ("event", b""))
-        # control socket (owner-only; it accepts window-management commands)
+
+    def _bind_control_socket(self):
+        """Owner-only socket accepting window-management commands (hzctl)."""
         try:
             os.unlink(CTRL_SOCK)
         except FileNotFoundError:
@@ -1922,6 +1970,15 @@ class Daemon(HyperZone):
         ctl.listen(8)
         ctl.setblocking(False)
         self.sel.register(ctl, selectors.EVENT_READ, ("ctl", None))
+
+    def run(self, stdio=False):
+        self.stdio = stdio
+        if stdio:
+            self._harden_stdio()
+        if not self._acquire_control_socket():
+            return
+        self._connect_event_socket()
+        self._bind_control_socket()
         refresh_gaps()              # borrow gaps/border from the live Hyprland config
         refresh_borders()           # config border colours (for repainting managed)
         self.retile(restore=True)   # restore prior layout if the daemon restarted
@@ -1940,12 +1997,13 @@ class Daemon(HyperZone):
                 kind = key.data[0]
                 if kind == "ctl":
                     conn, _ = key.fileobj.accept()
+                    data = ""
                     try:
                         data = conn.recv(8192).decode("utf-8", "replace").strip()
                         if data:
                             self.on_cmd(json.loads(data))
                     except Exception as e:
-                        log("ctl error", e)
+                        log("ctl error:", repr(e), "handling", data[:200])
                     finally:
                         conn.close()
                 elif kind == "event":
@@ -2005,11 +2063,11 @@ def send(cmd, arg=None):
 
 
 def cli_fallback(cmd, arg):
-    """If the daemon is down, degrade to a sensible native action (never hang)."""
+    """If the daemon is down, degrade to a sensible native action (never hang).
+    tomon has no fallback: this Hyprland's window.move takes no monitor target
+    (see Daemon.cmd_tomon), and the daemon's geometry teleport needs its state."""
     if cmd == "move":
         hbatch(['hl.dsp.window.move({direction="%s"})' % arg])
-    elif cmd == "tomon":
-        hbatch(['hl.dsp.window.move({monitor="%s"})' % arg[0]])
     elif cmd == "toggle-float":
         hbatch(['hl.dsp.window.float({action="toggle"})'])
 
