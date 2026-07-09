@@ -59,10 +59,10 @@ ADOPT_DELAY = 0.05        # s to let a new window settle before deciding to tile
                           # (is_tileable rejects them), so this only needs to absorb a
                           # one-frame lag — kept tiny so tiling feels instant.
 KILL_ENV = "HYPERZONE_OFF"   # set this env to 1 to disable management
-# Window classes that should never be tiled (genuine utility/popup windows).
-DENY_CLASSES = {"pavucontrol", "org.pulseaudio.pavucontrol", "blueman-manager",
-                "nm-connection-editor", "xdg-desktop-portal-gtk", "galculator",
-                "org.gnome.Calculator"}
+# Window classes that should never be tiled. A denied window is floated (and
+# centred) when it opens instead of being adopted. Deliberately minimal by
+# default — the user curates this list in the plugin settings.
+DENY_CLASSES = {"galculator", "org.gnome.Calculator"}
 
 # Managed monitors: four zones. Zone 1 and Zone 4 hold a single window each.
 # Zone 2 and Zone 3 hold one window WHOLE, or split into two halves when a second
@@ -1564,9 +1564,28 @@ class Daemon(HyperZone):
             self.remove(addr, stale)
         self.detached.discard(addr)
         c = self.client(addr)
+        if c and c.get("class", "") in DENY_CLASSES and not c.get("floating"):
+            # never-tile means never DOCKED either: a denied window that opened
+            # tiled (Hyprland's native layout grabbed it) is floated, centred on
+            # its monitor, so it behaves like the utility window it is.
+            self.float_deny(addr, c)
+            return
         mon = self.managed_monitor_for(c)
         if mon and self.is_tileable(c) and not mon.has(addr):
             self.place(addr, mon)
+
+    def float_deny(self, addr, c):
+        """Float a deny-classed window at its own size, centred on its monitor."""
+        mon = next((m for m in self.monitors_cached()
+                    if m.get("id") == c.get("monitor")), None)
+        exprs = ['hl.dsp.window.float({action="enable", window="address:%s"})' % addr]
+        if mon:
+            mx, my, mw, mh = logical_rect(mon)
+            sw, sh = (c.get("size") or [800, 600])
+            exprs.append('hl.dsp.window.move({x=%d,y=%d, window="address:%s"})'
+                         % (int(mx + (mw - sw) / 2), int(my + (mh - sh) / 2), addr))
+        hbatch(exprs)
+        dlog("deny-float", addr, c.get("class"))
 
     def unmanage_float_reset(self, addr, c):
         """A window is leaving a managed monitor for an UNMANAGED one: stop forcing

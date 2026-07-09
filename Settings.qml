@@ -39,13 +39,33 @@ ColumnLayout {
   }
   // The plugin popup's single "Apply" calls this. It saves the config AND commits
   // display edits — but only when the displays actually changed, and never while a
-  // confirm-or-revert is already pending (that would be rejected).
+  // confirm-or-revert is already pending (the daemon would reject that; the
+  // banner above the Apply button says so while it's the case).
   function saveSettings() {
     apply()
-    if (hz && hz.pendingLayout === null && displaysDirty()) applyDisplays()
+    if (!hz) return
+    if (hz.pendingLayout !== null) {
+      if (displaysDirty())
+        ToastService.showNotice("HyperZone", "Display change waiting for Keep / Revert — new display edits not applied")
+      return
+    }
+    if (displaysDirty()) applyDisplays()
   }
 
   // ---------- config helpers ----------
+  function addDenyClass(cls) {
+    cls = String(cls || "").trim()
+    if (!cls) return
+    var list = (edit.deny_classes || []).slice()
+    if (list.indexOf(cls) !== -1) return
+    list.push(cls)
+    edit.deny_classes = list
+    rev++
+  }
+  function removeDenyClass(cls) {
+    edit.deny_classes = (edit.deny_classes || []).filter(function (c) { return c !== cls })
+    rev++
+  }
   function monEntry(name) {
     if (!edit.managed[name]) edit.managed[name] = { enabled: false, layout: defaultLayout() }
     if (!edit.managed[name].layout) edit.managed[name].layout = defaultLayout()
@@ -235,33 +255,9 @@ ColumnLayout {
         }
       }
 
-      // confirm-or-revert banner (bound to the daemon's pending state, so it
-      // survives this popup being closed and reopened mid-countdown)
-      NBox {
-        Layout.fillWidth: true
-        visible: root.hz && root.hz.pendingLayout !== null
-        implicitHeight: pendRow.implicitHeight + Style.marginM * 2
-        property int remain: 0
-        Timer {
-          running: parent.visible; interval: 500; repeat: true
-          onTriggered: parent.remain = (root.hz && root.hz.pendingLayout)
-                       ? Math.max(0, Math.round(root.hz.pendingLayout.deadline - Date.now() / 1000)) : 0
-        }
-        RowLayout {
-          id: pendRow
-          anchors.fill: parent; anchors.margins: Style.marginM; spacing: Style.marginM
-          NText {
-            Layout.fillWidth: true
-            text: "Keep this display layout? Reverting in " + parent.parent.remain + "s"
-            font.weight: Style.fontWeightMedium
-          }
-          NButton { text: "Keep"; onClicked: root.hz.request("confirm_monitor_layout", {}) }
-          NButton { text: "Revert"; outlined: true; onClicked: root.hz.request("revert_monitor_layout", {}) }
-        }
-      }
-
       // No per-tab apply button — the popup's single Apply commits display edits too
-      // (live, with the confirm-or-revert safety above). Just tell the user how.
+      // (live, with confirm-or-revert safety; that banner lives at the bottom of
+      // this panel, right above Apply, so it's visible from any tab).
       NText {
         Layout.fillWidth: true; Layout.topMargin: Style.marginS; wrapMode: Text.WordWrap
         text: "Press Apply at the bottom to apply display changes. They take effect immediately; " +
@@ -365,11 +361,56 @@ ColumnLayout {
         value: (root.rev, root.edit.adopt_delay !== undefined ? root.edit.adopt_delay : 0.05)
         onMoved: (v) => root.edit.adopt_delay = Math.round(v * 100) / 100
       }
-      NTextInput {
+      // Never-tile classes as removable tags. A denied window always opens
+      // floating (centred on its screen) instead of being tiled or docked.
+      ColumnLayout {
         Layout.fillWidth: true
-        label: "Never-tile window classes (comma-separated)"
-        text: (root.rev, (root.edit.deny_classes || []).join(", "))
-        onEditingFinished: root.edit.deny_classes = text.split(",").map(function (s) { return s.trim() }).filter(function (s) { return s.length })
+        spacing: Style.marginXS
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.marginM
+          NTextInput {
+            id: denyInput
+            Layout.fillWidth: true
+            label: "Never-tile window classes"
+            description: "These always open floating · Enter or Add"
+            placeholderText: "window class, e.g. org.gnome.Calculator"
+            onAccepted: { root.addDenyClass(text); text = "" }
+          }
+          NButton {
+            text: "Add"
+            Layout.alignment: Qt.AlignBottom
+            enabled: denyInput.text.trim().length > 0
+            onClicked: { root.addDenyClass(denyInput.text); denyInput.text = "" }
+          }
+        }
+        Flow {
+          Layout.fillWidth: true
+          spacing: Style.marginXS
+          Repeater {
+            model: (root.rev, root.edit.deny_classes || [])
+            delegate: Rectangle {
+              radius: height / 2
+              color: Color.mSurfaceVariant
+              border.color: Color.mOutline
+              border.width: 1
+              implicitWidth: chipRow.implicitWidth + Style.marginM * 2
+              implicitHeight: chipRow.implicitHeight + Style.marginXS * 2
+              RowLayout {
+                id: chipRow
+                anchors.centerIn: parent
+                spacing: Style.marginXS
+                NText { text: modelData; pointSize: Style.fontSizeS }
+                NIconButton {
+                  icon: "close"
+                  baseSize: Style.baseWidgetSize * 0.55
+                  tooltipText: "Remove"
+                  onClicked: root.removeDenyClass(modelData)
+                }
+              }
+            }
+          }
+        }
       }
       NTextInput {
         Layout.fillWidth: true
@@ -409,6 +450,34 @@ ColumnLayout {
           else { ToastService.showNotice("HyperZone", "Already persisted"); root.hz.refresh() }
         })
       }
+    }
+  }
+
+  // Confirm-or-revert banner: sits at the very bottom of the panel, directly
+  // above the popup's Apply/Close row, on every tab. While it's showing, Apply
+  // won't touch displays (saveSettings skips them) — Keep or Revert first.
+  // Bound to the daemon's pending state, so it survives popup close/reopen.
+  NBox {
+    Layout.fillWidth: true
+    visible: root.hz && root.hz.daemonReady && root.hz.pendingLayout !== null
+    implicitHeight: pendRow.implicitHeight + Style.marginM * 2
+    color: Color.mSurfaceVariant
+    property int remain: 0
+    Timer {
+      running: parent.visible; interval: 500; repeat: true
+      onTriggered: parent.remain = (root.hz && root.hz.pendingLayout)
+                   ? Math.max(0, Math.round(root.hz.pendingLayout.deadline - Date.now() / 1000)) : 0
+    }
+    RowLayout {
+      id: pendRow
+      anchors.fill: parent; anchors.margins: Style.marginM; spacing: Style.marginM
+      NText {
+        Layout.fillWidth: true; wrapMode: Text.WordWrap
+        text: "Keep this display layout? Auto-revert in " + parent.parent.remain + "s · Apply is paused for displays until you decide"
+        font.weight: Style.fontWeightMedium
+      }
+      NButton { text: "Keep"; onClicked: root.hz.request("confirm_monitor_layout", {}) }
+      NButton { text: "Revert"; outlined: true; onClicked: root.hz.request("revert_monitor_layout", {}) }
     }
   }
 
