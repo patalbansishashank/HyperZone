@@ -156,6 +156,15 @@ map ids to hzctl invocations and seed the defaults.
   (managed set + each monitor's compiled zones/fill/nice/enabled) before vs after, and skips the
   retile entirely for keybind/deny/border edits. When it does retile, it's the gentle one. (Was an
   unconditional `retile(force=True)` on every Apply → reshuffled windows on any settings change.)
+- **Floating popups on a managed screen are capped to a zone** (`float_popup`, from `try_adopt`): a
+  fresh floating non-tileable toplevel (file/download dialogs) is resized to ≤ the zone under the
+  cursor, centred there, and painted the amber floating border. Stops huge dialogs overflowing a 4K
+  screen. Menus/tooltips are xdg-popups (not toplevels) so they never reach `try_adopt`.
+- **UI model: zones per screen (1/2/4), no managed toggle.** The settings expose a zone-count select
+  (`zoneCountOf`/`setZoneCount`) — 1 = unmanaged (single zone, default Hyprland), 2/4 = tiled — instead
+  of a separate "Managed" toggle. It maps onto the daemon's existing `enabled` flag (1 → enabled:false).
+  The daemon is unchanged; "managed" == `enabled && zones>=2`. HyperZone still moves windows/focus
+  to/from 1-zone screens; it just doesn't split them.
 
 ## Git / push
 

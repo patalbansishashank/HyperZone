@@ -200,6 +200,15 @@ ColumnLayout {
   }
   function managedNames() { var out = []; for (var name in edit.managed) if (edit.managed[name].enabled) out.push(name); return out }
   function isManaged(name) { var mc = edit.managed ? edit.managed[name] : null; return !!(mc && mc.enabled) }
+  function allMonitorNames() { var out = []; for (var name in (edit.managed || {})) out.push(name); return out }
+  // A screen is described by its zone count: 1 = unmanaged (single zone, default
+  // Hyprland), 2 = vertical split, 4 = quadrants. That replaces the managed toggle.
+  function zoneCountOf(name) { return isManaged(name) ? layoutOf(name).zones : 1 }
+  function setZoneCount(name, n) {
+    if (n === 1) { monEntry(name).enabled = false }
+    else { monEntry(name).enabled = true; setZones(name, n) }
+    rev++; apply()
+  }
 
   // ---------- display editor state ----------
   property var dispEdit: []
@@ -331,10 +340,11 @@ ColumnLayout {
               currentKey: (root.dispRev, String(root.selDisp() ? root.selDisp().transform : 0))
               onSelected: (key) => root.setDisp("transform", parseInt(key))
             }
-            NToggle {
-              label: "Managed"
-              checked: (root.rev, root.selDisp() ? root.isManaged(root.selDisp().name) : false)
-              onToggled: (v) => { if (root.selDisp()) root.setEnabled(root.selDisp().name, v) }
+            NComboBox {
+              label: "Zones"; minimumWidth: 130
+              model: [{ key: "1", name: "1 · off" }, { key: "2", name: "2 zones" }, { key: "4", name: "4 zones" }]
+              currentKey: (root.rev, root.selDisp() ? String(root.zoneCountOf(root.selDisp().name)) : "1")
+              onSelected: (key) => { if (root.selDisp()) root.setZoneCount(root.selDisp().name, parseInt(key)) }
             }
           }
         }
@@ -357,70 +367,78 @@ ColumnLayout {
     // ================= ZONES =================
     ColumnLayout {
       spacing: Style.marginM
-      NLabel { label: "Zone layout"; description: "How windows tile on each managed screen" }
-
-      NText {
-        Layout.fillWidth: true
-        visible: (root.rev, root.managedNames().length === 0)
-        text: "No managed screens yet — enable one under Displays."
-        color: Color.mOnSurfaceVariant
-      }
+      NLabel { label: "Zones"; description: "How many zones to split each screen into — 1 leaves it on default Hyprland" }
 
       Repeater {
-        model: (root.rev, root.managedNames())
+        model: (root.rev, root.allMonitorNames())
         delegate: NCollapsible {
           Layout.fillWidth: true
-          label: modelData
-          expanded: index === 0
           readonly property string mon: modelData
+          readonly property int zc: (root.rev, root.zoneCountOf(mon))
+          label: mon + "  ·  " + (zc === 1 ? "off" : (zc + " zones"))
+          expanded: index === 0
 
           RowLayout {
             Layout.fillWidth: true; spacing: Style.marginM
             NText { text: "Zones:"; Layout.alignment: Qt.AlignVCenter }
             NComboBox {
-              minimumWidth: 120
-              model: [{ key: "2", name: "2 zones" }, { key: "4", name: "4 zones" }]
-              currentKey: (root.rev, String(root.layoutOf(mon).zones))
-              onSelected: (key) => root.setZones(mon, parseInt(key))
+              minimumWidth: 130
+              model: [{ key: "1", name: "1 · off" }, { key: "2", name: "2 zones" }, { key: "4", name: "4 zones" }]
+              currentKey: (root.rev, String(root.zoneCountOf(mon)))
+              onSelected: (key) => root.setZoneCount(mon, parseInt(key))
             }
-          }
-
-          ZoneEditor {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 284
-            zones: (root.rev, root.layoutOf(mon).zones)
-            vsplit: (root.rev, root.layoutOf(mon).vsplit)
-            hsplit: (root.rev, root.layoutOf(mon).hsplit)
-            fill: (root.rev, root.fillOf(mon))
-            subdivide: (root.rev, root.layoutOf(mon).subdivide || [])
-            onSplitChanged: (v, h) => root.setSplit(mon, v, h)
           }
 
           NText {
-            text: "Fill order (top = first) · check = subdivides when a 2nd window lands"
+            visible: zc === 1
+            Layout.fillWidth: true; wrapMode: Text.WordWrap
+            text: "Single zone — this screen keeps Hyprland's default tiling. HyperZone still moves " +
+                  "windows and focus to/from it; it just doesn't split it into zones."
             pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
-          }
-          NReorderCheckboxes {
-            Layout.fillWidth: true
-            model: (root.rev, root.fillModel(mon))
-            onItemToggled: (index, enabled) => root.toggleSub(mon, root.fillOf(mon)[index], enabled)
-            onItemsReordered: (from, to) => {
-              var fill = root.fillOf(mon).slice(); var m = fill.splice(from, 1)[0]; fill.splice(to, 0, m)
-              root.setFillOrder(mon, fill)
-            }
           }
 
           ColumnLayout {
             Layout.fillWidth: true
-            visible: (root.rev, (root.layoutOf(mon).subdivide || []).length >= 2)
-            spacing: Style.marginXS
-            NText { text: "Subdivision fill order"; pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant }
+            visible: zc >= 2
+            spacing: Style.marginS
+
+            ZoneEditor {
+              Layout.fillWidth: true
+              Layout.preferredHeight: 284
+              zones: (root.rev, root.layoutOf(mon).zones)
+              vsplit: (root.rev, root.layoutOf(mon).vsplit)
+              hsplit: (root.rev, root.layoutOf(mon).hsplit)
+              fill: (root.rev, root.fillOf(mon))
+              subdivide: (root.rev, root.layoutOf(mon).subdivide || [])
+              onSplitChanged: (v, h) => root.setSplit(mon, v, h)
+            }
+
+            NText {
+              text: "Fill order (top = first) · check = subdivides when a 2nd window lands"
+              pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
+            }
             NReorderCheckboxes {
               Layout.fillWidth: true
-              model: (root.rev, root.subModel(mon))
+              model: (root.rev, root.fillModel(mon))
+              onItemToggled: (index, enabled) => root.toggleSub(mon, root.fillOf(mon)[index], enabled)
               onItemsReordered: (from, to) => {
-                var s = (root.layoutOf(mon).subdivide || []).slice(); var m = s.splice(from, 1)[0]; s.splice(to, 0, m)
-                root.setSubOrder(mon, s)
+                var fill = root.fillOf(mon).slice(); var m = fill.splice(from, 1)[0]; fill.splice(to, 0, m)
+                root.setFillOrder(mon, fill)
+              }
+            }
+
+            ColumnLayout {
+              Layout.fillWidth: true
+              visible: (root.rev, (root.layoutOf(mon).subdivide || []).length >= 2)
+              spacing: Style.marginXS
+              NText { text: "Subdivision fill order"; pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant }
+              NReorderCheckboxes {
+                Layout.fillWidth: true
+                model: (root.rev, root.subModel(mon))
+                onItemsReordered: (from, to) => {
+                  var s = (root.layoutOf(mon).subdivide || []).slice(); var m = s.splice(from, 1)[0]; s.splice(to, 0, m)
+                  root.setSubOrder(mon, s)
+                }
               }
             }
           }
