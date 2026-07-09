@@ -898,12 +898,14 @@ class HyperZone:
     # -- placement --
     @staticmethod
     def rank_entry_zones(mon, rect, direction):
-        """Zone indices of `mon` ranked for a window arriving from `rect` moving
-        `direction`: closest on the PERPENDICULAR axis first (so a window from a
-        screen's top lands in the target's top, bottom→bottom), then nearest the edge
-        it enters through (moving right → left column first, moving left → right
-        column, etc). Placement fills the best EMPTY zone in this order. Rects are
-        global-logical; zone rects are monitor-local, so shift by mon.ox/oy."""
+        """(zone_index, aligned) for each zone of `mon`, ranked for a window arriving
+        from `rect` moving `direction`: closest on the PERPENDICULAR axis first (so a
+        window from a screen's top lands in the target's top, bottom→bottom), then
+        nearest the edge it enters through (moving right → left column first, left →
+        right column, etc). `aligned` is True when the window's perpendicular centre
+        falls within the zone's perpendicular span; placement prefers aligned zones so
+        a window never jumps to the opposite half just because an empty zone is there.
+        Rects are global-logical; zone rects are monitor-local, so shift by mon.ox/oy."""
         wx, wy, ww, wh = rect
         wcx, wcy = wx + ww / 2.0, wy + wh / 2.0
         ranked = []
@@ -914,28 +916,34 @@ class HyperZone:
             if direction in ("left", "right"):
                 perp = abs(gcy - wcy)
                 edge = -gx if direction == "left" else gx
+                aligned = gy <= wcy <= gy + rh
             else:
                 perp = abs(gcx - wcx)
                 edge = -gy if direction == "up" else gy
-            ranked.append((perp, edge, zi))
-        ranked.sort()
-        return [zi for _, _, zi in ranked]
+                aligned = gx <= wcx <= gx + rw
+            ranked.append((perp, edge, zi, aligned))
+        ranked.sort(key=lambda t: t[:2])
+        return [(zi, aligned) for _, _, zi, aligned in ranked]
 
     def _place_ranked(self, addr, mon, ranked):
-        """Land addr in the best-aligned zone from `ranked` (see rank_entry_zones):
-        the first EMPTY one whole; or, if every zone is already occupied, subdivide
-        the top-ranked zone so it still lands on the aligned side (bottom-origin ->
-        bottom zone) instead of the normal nice/overflow default, which fills the top
-        first. Always places when `ranked` is non-empty."""
-        for zi in ranked:
+        """Land addr from a cross-monitor move (see rank_entry_zones): prefer zones
+        ALIGNED with the window's perpendicular half — fill the first empty one whole,
+        or, if all aligned zones are occupied, subdivide the best-ranked aligned one.
+        So a top-origin window stays top even when the top is full and the bottom is
+        empty (and a bottom-origin one stays bottom), instead of jumping halves or
+        using the normal nice/overflow default (which fills the top first). Only if no
+        zone is aligned (window centre off every zone) does it fall back to plain
+        ranked order. Always places when `ranked` is non-empty."""
+        order = [zi for zi, al in ranked if al] or [zi for zi, _ in ranked]
+        for zi in order:
             if mon.trees[zi] is None:
                 self.was_managed.discard(addr)
                 mon.trees[zi] = leaf(addr)
                 dlog("cross-place", addr, "-> empty zone", zi + 1, mon.name)
                 self.apply(mon)
                 return True
-        if ranked:
-            zi = ranked[0]
+        if order:
+            zi = order[0]
             lf, rect = next(walk(mon.trees[zi], mon.zone_rect(zi)))
             split_leaf(lf, addr, rect, new_first=self._new_first(mon, rect))
             self.was_managed.discard(addr)
