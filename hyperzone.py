@@ -1116,6 +1116,7 @@ class Daemon(HyperZone):
         self.rpc_out = None         # private handle to the REAL stdout (see run())
         self.layout_revert_at = None    # deadline to auto-revert a pending display layout
         self.layout_prev_specs = None   # live specs snapshotted before an apply (for exact revert)
+        self.monitors_refresh_at = None # deadline for a deferred (settled) monitors_changed push
 
     # -- JSON-RPC over stdio (plugin control channel) --
     def _rpc_write(self, obj):
@@ -1304,8 +1305,11 @@ class Daemon(HyperZone):
             _atomic_write(MONITORS_LUA, generate_monitors_lua(specs))
         timeout_s = float(params.get("timeout_s", 15))
         self.layout_revert_at = time.time() + timeout_s
-        # push the now-applied monitor state so the UI's preview reflects reality
-        self.emit("monitors_changed", {"monitors": self.live_monitors()})
+        # Hyprland reports the new mode/scale/transform a beat AFTER the eval
+        # (measured ~0.4s); a synchronous live_monitors() read is stale and would
+        # bounce the UI's preview back to the old value. Defer the state push to a
+        # settled read in tick().
+        self.monitors_refresh_at = time.time() + 0.5
         self.emit("layout_pending", self.pending_layout_info())
         return {"deadline": self.layout_revert_at, "persisted": migrated}
 
@@ -1348,7 +1352,7 @@ class Daemon(HyperZone):
         except OSError as e:
             log("revert_layout file error", e)
         log("display layout reverted:", reason)
-        self.emit("monitors_changed", {"monitors": self.live_monitors()})
+        self.monitors_refresh_at = time.time() + 0.5   # settled read (see apply)
         self.emit("layout_reverted", {"reason": reason})
 
     def rpc_migrate_hyprland_config(self, params):
@@ -1451,6 +1455,9 @@ class Daemon(HyperZone):
             self.run_verify()
         if self.layout_revert_at is not None and now >= self.layout_revert_at:
             self.revert_layout("timeout")   # nobody confirmed -> auto-restore
+        if self.monitors_refresh_at is not None and now >= self.monitors_refresh_at:
+            self.monitors_refresh_at = None
+            self.emit("monitors_changed", {"monitors": self.live_monitors()})
         self.flush()                 # single coalesced geometry pass
 
     def next_timeout(self):
@@ -1464,6 +1471,8 @@ class Daemon(HyperZone):
             deadlines.append(self.verify_at)
         if self.layout_revert_at is not None:
             deadlines.append(self.layout_revert_at)
+        if self.monitors_refresh_at is not None:
+            deadlines.append(self.monitors_refresh_at)
         if not deadlines:
             return None
         return max(0.0, min(deadlines) - time.time())
