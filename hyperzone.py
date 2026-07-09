@@ -2373,10 +2373,28 @@ class Daemon(HyperZone):
         if not c:
             self.cmd_focus_from_cursor(direction)
             return
-        win = self._focus_target(c, direction)
-        if win:
-            hbatch(['hl.dsp.focus({window="address:%s"})' % win])
+        tgt = self._focus_target(c, direction)
+        if tgt:
+            self._focus_window(tgt, cross=tgt.get("monitor") != c.get("monitor"))
         # else: no window that way anywhere -> stay put
+
+    @staticmethod
+    def _focus_window(tgt, cross):
+        """Focus a window; when CROSSING monitors, warp the cursor to it first (one
+        batch). Hyprland's cross-monitor focusWindow activates the target monitor
+        before focusing, and that activation momentarily restores the monitor's
+        LAST-ACTIVE window — a visible one-frame flash of the wrong window (verified
+        via socket2: focusedmon -> activewindowv2 <old> -> activewindowv2 <target>).
+        With the cursor already on the target, the activation resolves to the target
+        itself and the flash is gone. Focus warps the cursor here anyway, so this only
+        changes ordering, not behaviour."""
+        exprs = []
+        if cross:
+            at, sz = tgt.get("at") or [0, 0], tgt.get("size") or [0, 0]
+            exprs.append('hl.dsp.cursor.move({x=%d,y=%d})'
+                         % (at[0] + sz[0] // 2, at[1] + sz[1] // 2))
+        exprs.append('hl.dsp.focus({window="address:%s"})' % tgt.get("address"))
+        hbatch(exprs)
 
     def cmd_focus_from_cursor(self, direction):
         """Recovery when there is NO active window (focus was left on an empty screen):
@@ -2385,11 +2403,11 @@ class Daemon(HyperZone):
         pos = hjson("cursorpos") or {}
         cx, cy = pos.get("x"), pos.get("y")
         if cx is None:
-            win = self._nearest_window(0, 0, None)
+            tgt = self._nearest_window(0, 0, None)
         else:
-            win = self._nearest_window(cx, cy, direction)
-        if win:
-            hbatch(['hl.dsp.focus({window="address:%s"})' % win])
+            tgt = self._nearest_window(cx, cy, direction)
+        if tgt:
+            self._focus_window(tgt, cross=True)   # coming from an empty screen
 
     def _focusable_windows(self):
         """Mapped windows currently visible (on each monitor's active workspace)."""
@@ -2452,11 +2470,11 @@ class Daemon(HyperZone):
                 prim, overlap, perp = ccy - ocy, min(cr, orr) - max(cl, ol), abs(ocx - ccx)
             key = (0 if overlap > 0 else 1, prim, perp)
             if best is None or key < best[0]:
-                best = (key, o.get("address"))
+                best = (key, o)
         return best[1] if best else None
 
     def _nearest_window(self, px, py, direction):
-        """Address of the focusable window nearest point (px, py). With `direction`,
+        """The focusable window (client dict) nearest point (px, py). With `direction`,
         prefer windows that way but fall back to the overall nearest, so focus can
         never get stuck with no window to go to."""
         best_dir = best_any = None
@@ -2465,12 +2483,12 @@ class Daemon(HyperZone):
             ocx, ocy = oa[0] + os_[0] / 2.0, oa[1] + os_[1] / 2.0
             d2 = (ocx - px) ** 2 + (ocy - py) ** 2
             if best_any is None or d2 < best_any[0]:
-                best_any = (d2, o.get("address"))
+                best_any = (d2, o)
             if direction:
                 that_way = {"right": ocx > px, "left": ocx < px,
                             "up": ocy < py, "down": ocy > py}.get(direction, True)
                 if that_way and (best_dir is None or d2 < best_dir[0]):
-                    best_dir = (d2, o.get("address"))
+                    best_dir = (d2, o)
         if direction and best_dir:
             return best_dir[1]
         return best_any[1] if best_any else None
