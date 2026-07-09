@@ -2360,23 +2360,23 @@ class Daemon(HyperZone):
                 % (name, addr)])
 
     def cmd_focus(self, addr, direction):
-        """Directional focus that respects the monitor layout. WITHIN a screen we
-        defer to Hyprland's native directional focus (it handles tiled/floating/groups
-        perfectly, and instantly). Only when nothing lies that way on THIS screen do we
-        cross — to the nearest actual WINDOW in that direction on another monitor,
-        SKIPPING empty screens so focus only ever lands on a real window (never strands
-        the cursor on a blank monitor). If there's no window that way at all, stay put."""
+        """Directional focus, computed FRESH from live window geometry on every press
+        — one algorithm across all screens, no native delegation, nothing tracked. The
+        target is the best window in `direction` among every visible window on any
+        monitor (_focus_target): true row/column neighbours (perpendicular overlap)
+        always beat unaligned ones, so bottom-left -> right lands on bottom-right even
+        when the top-right zone is subdivided (native focus jumped into that
+        subdivision), left never wraps to the other side of the screen, empty monitors
+        are skipped (no window there = no candidate), and at the edge of the desk focus
+        simply stays put."""
         c = self.client(addr)
         if not c:
-            hbatch(['hl.dsp.focus({direction="%s"})' % direction])
+            self.cmd_focus_from_cursor(direction)
             return
-        if self._same_mon_focus_target(c, direction):
-            hbatch(['hl.dsp.focus({direction="%s"})' % direction])
-            return
-        win = self._cross_focus_target(c, direction)
+        win = self._focus_target(c, direction)
         if win:
             hbatch(['hl.dsp.focus({window="address:%s"})' % win])
-        # else: no window that way -> stay put (never focus an empty screen)
+        # else: no window that way anywhere -> stay put
 
     def cmd_focus_from_cursor(self, direction):
         """Recovery when there is NO active window (focus was left on an empty screen):
@@ -2405,39 +2405,52 @@ class Daemon(HyperZone):
             out.append(o)
         return out
 
-    def _cross_focus_target(self, c, direction):
-        """Nearest focusable window in `direction` on ANOTHER monitor. Prefers windows
-        that line up on the perpendicular axis (share rows for left/right, columns for
-        up/down), else the nearest by primary-axis distance. Empty monitors have no
-        windows, so they're skipped for free. None if nothing lies that way."""
+    def _focus_target(self, c, direction):
+        """The window focus should land on: best candidate in `direction` of c among
+        ALL visible windows on every monitor, ranked by
+          1. alignment  — true row/column neighbours (perpendicular overlap with c)
+                          always beat unaligned ones, no matter the distance;
+          2. primary-axis centre distance (nearest first);
+          3. perpendicular centre offset (most in-line first).
+        One geometric rule for in-screen and cross-screen: a same-screen aligned
+        neighbour is nearer so it wins; with no aligned window on this screen the
+        nearest aligned one on the next screen wins over an unaligned same-screen
+        window (bottom row stays in the bottom row); unaligned windows are a last
+        resort so focus still moves when something exists that way. None = nothing
+        that way at all."""
         at = c.get("at") or [0, 0]
         sz = c.get("size") or [0, 0]
         cl, ct, cr, cb = at[0], at[1], at[0] + sz[0], at[1] + sz[1]
         ccx, ccy = (cl + cr) / 2.0, (ct + cb) / 2.0
-        mid = c.get("monitor")
         M = DIR_MARGIN_PX
         best = None
         for o in self._focusable_windows():
-            if o.get("address") == c.get("address") or o.get("monitor") == mid:
+            if o.get("address") == c.get("address"):
                 continue
             oa, os_ = o.get("at") or [0, 0], o.get("size") or [0, 0]
             ol, ot, orr, ob = oa[0], oa[1], oa[0] + os_[0], oa[1] + os_[1]
             ocx, ocy = (ol + orr) / 2.0, (ot + ob) / 2.0
-            if direction == "right" and ocx <= ccx + M:
-                continue
-            if direction == "left" and ocx >= ccx - M:
-                continue
-            if direction == "down" and ocy <= ccy + M:
-                continue
-            if direction == "up" and ocy >= ccy - M:
-                continue
-            if direction in ("left", "right"):
-                prim = abs(ocx - ccx)
-                aligned = min(cb, ob) - max(ct, ot) > 0
-            else:
-                prim = abs(ocy - ccy)
-                aligned = min(cr, orr) - max(cl, ol) > 0
-            key = (0 if aligned else 1, prim)   # aligned first, then nearest
+            # A candidate is "that way" only when its centre is beyond MY EDGE in that
+            # direction (not merely beyond my centre): a top-right subdivision whose
+            # centre is horizontally inside a wide bottom window is above it, not
+            # right of it — using centres made focus-right jump into it.
+            if direction == "right":
+                if ocx <= cr - M:
+                    continue
+                prim, overlap, perp = ocx - ccx, min(cb, ob) - max(ct, ot), abs(ocy - ccy)
+            elif direction == "left":
+                if ocx >= cl + M:
+                    continue
+                prim, overlap, perp = ccx - ocx, min(cb, ob) - max(ct, ot), abs(ocy - ccy)
+            elif direction == "down":
+                if ocy <= cb - M:
+                    continue
+                prim, overlap, perp = ocy - ccy, min(cr, orr) - max(cl, ol), abs(ocx - ccx)
+            else:   # up
+                if ocy >= ct + M:
+                    continue
+                prim, overlap, perp = ccy - ocy, min(cr, orr) - max(cl, ol), abs(ocx - ccx)
+            key = (0 if overlap > 0 else 1, prim, perp)
             if best is None or key < best[0]:
                 best = (key, o.get("address"))
         return best[1] if best else None
@@ -2461,43 +2474,6 @@ class Daemon(HyperZone):
         if direction and best_dir:
             return best_dir[1]
         return best_any[1] if best_any else None
-
-    @staticmethod
-    def _same_mon_focus_target(c, direction):
-        """Is there a window on c's monitor+workspace that is a TRUE directional
-        neighbour of it — `direction` of it AND overlapping on the perpendicular axis?
-        The overlap matters: a bottom-right window has the top-right one further right
-        in x, but they don't share any rows, so 'right' from the bottom should cross to
-        the next display, not jump up to the top-right. If a real neighbour exists we
-        keep focus native; otherwise the caller crosses screens."""
-        at = c.get("at") or [0, 0]
-        sz = c.get("size") or [0, 0]
-        cl, ct, cr, cb = at[0], at[1], at[0] + sz[0], at[1] + sz[1]
-        ccx, ccy = (cl + cr) / 2.0, (ct + cb) / 2.0
-        mid = c.get("monitor")
-        ws = (c.get("workspace") or {}).get("id")
-        M = DIR_MARGIN_PX
-        for o in hjson("clients") or []:
-            if o.get("address") == c.get("address") or o.get("monitor") != mid:
-                continue
-            if (o.get("workspace") or {}).get("id") != ws or o.get("hidden"):
-                continue
-            oa, os_ = o.get("at") or [0, 0], o.get("size") or [0, 0]
-            if os_[0] <= 0 or os_[1] <= 0:
-                continue
-            ol, ot, orr, ob = oa[0], oa[1], oa[0] + os_[0], oa[1] + os_[1]
-            ocx, ocy = (ol + orr) / 2.0, (ot + ob) / 2.0
-            if direction in ("left", "right"):
-                if min(cb, ob) - max(ct, ot) <= 0:          # no shared rows
-                    continue
-                if (ocx > ccx + M) if direction == "right" else (ocx < ccx - M):
-                    return True
-            else:
-                if min(cr, orr) - max(cl, ol) <= 0:         # no shared columns
-                    continue
-                if (ocy > ccy + M) if direction == "down" else (ocy < ccy - M):
-                    return True
-        return False
 
     def cmd_snap_drop(self, addr):
         """A window was dropped on the managed screen: snap it into the zone/space
