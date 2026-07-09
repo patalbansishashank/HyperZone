@@ -2385,12 +2385,16 @@ class Daemon(HyperZone):
 
     @staticmethod
     def _same_mon_focus_target(c, direction):
-        """Any other mapped window on c's monitor+workspace that lies `direction` of
-        it (loose axis test). Conservative: erring toward True keeps focus native
-        rather than wrongly jumping screens."""
+        """Is there a window on c's monitor+workspace that is a TRUE directional
+        neighbour of it — `direction` of it AND overlapping on the perpendicular axis?
+        The overlap matters: a bottom-right window has the top-right one further right
+        in x, but they don't share any rows, so 'right' from the bottom should cross to
+        the next display, not jump up to the top-right. If a real neighbour exists we
+        keep focus native; otherwise the caller crosses screens."""
         at = c.get("at") or [0, 0]
         sz = c.get("size") or [0, 0]
-        cx, cy = at[0] + sz[0] / 2.0, at[1] + sz[1] / 2.0
+        cl, ct, cr, cb = at[0], at[1], at[0] + sz[0], at[1] + sz[1]
+        ccx, ccy = (cl + cr) / 2.0, (ct + cb) / 2.0
         mid = c.get("monitor")
         ws = (c.get("workspace") or {}).get("id")
         M = DIR_MARGIN_PX
@@ -2402,10 +2406,18 @@ class Daemon(HyperZone):
             oa, os_ = o.get("at") or [0, 0], o.get("size") or [0, 0]
             if os_[0] <= 0 or os_[1] <= 0:
                 continue
-            ox, oy = oa[0] + os_[0] / 2.0, oa[1] + os_[1] / 2.0
-            if {"left": ox < cx - M, "right": ox > cx + M,
-                "up": oy < cy - M, "down": oy > cy + M}[direction]:
-                return True
+            ol, ot, orr, ob = oa[0], oa[1], oa[0] + os_[0], oa[1] + os_[1]
+            ocx, ocy = (ol + orr) / 2.0, (ot + ob) / 2.0
+            if direction in ("left", "right"):
+                if min(cb, ob) - max(ct, ot) <= 0:          # no shared rows
+                    continue
+                if (ocx > ccx + M) if direction == "right" else (ocx < ccx - M):
+                    return True
+            else:
+                if min(cr, orr) - max(cl, ol) <= 0:         # no shared columns
+                    continue
+                if (ocy > ccy + M) if direction == "down" else (ocy < ccy - M):
+                    return True
         return False
 
     @staticmethod
