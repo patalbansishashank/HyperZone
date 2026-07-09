@@ -1900,11 +1900,11 @@ class Daemon(HyperZone):
                 return zi
         return None
 
-    def _popup_budget(self, c, mon):
-        """(x, y, w, h) a popup on `mon` should not exceed: the app's own LARGEST
-        window on this monitor (a dialog belongs inside its own window), or the zone
-        under the cursor when the app has no other window here. Keyed on pid so a
-        popup is measured against its parent app, never the whole screen."""
+    def _app_window(self, c, mon):
+        """(w, h) of the app's LARGEST window on `mon` (same pid), or None. Used only
+        to decide whether a popup is oversized: a menu/dropdown is smaller than its own
+        app window, so it fails this test and is left alone; a runaway file dialog is
+        bigger, so it gets fitted."""
         pid, mid = c.get("pid"), c.get("monitor")
         best = None
         if pid is not None:
@@ -1913,12 +1913,16 @@ class Daemon(HyperZone):
                     continue
                 if o.get("monitor") != mid or o.get("hidden"):
                     continue
-                sz, at = o.get("size") or [0, 0], o.get("at") or [0, 0]
+                sz = o.get("size") or [0, 0]
                 area = sz[0] * sz[1]
                 if area > 0 and (best is None or area > best[0]):
-                    best = (area, at[0], at[1], sz[0], sz[1])
-        if best is not None:
-            return best[1], best[2], best[3], best[4]
+                    best = (area, sz[0], sz[1])
+        return (best[1], best[2]) if best else None
+
+    def _popup_zone_rect(self, c, mon):
+        """Global rect of the zone a popup on `mon` sits in (cursor first, else its own
+        centre). This is its container — big enough even when the app's window is a
+        narrow subdivided half, so we don't fight the popup's minimum size."""
         pos = hjson("cursorpos") or {}
         zi = self._zone_at_point(mon, pos.get("x"), pos.get("y"))
         if zi is None:
@@ -1929,31 +1933,35 @@ class Daemon(HyperZone):
 
     def float_popup(self, addr, c):
         """A floating dialog that opened on a managed screen BIGGER than the app window
-        it belongs to — a file/download dialog ballooning off a 4K screen. Shrink it to
-        fit that window, centre it on it, clamp on-screen, and paint the floating border
-        so it reads as a popup. A popup that already fits its window (menus, dropdowns,
-        tooltips, normal dialogs) is LEFT EXACTLY where the app put it — we must never
-        reposition an app menu (that broke Steam/VLC menu bars)."""
+        it belongs to — a file/download dialog ballooning off a 4K screen. Cap it to the
+        ZONE it's over (its container, wide enough even when the app is in a narrow
+        subdivided half, so we don't fight the dialog's minimum size), centre it there,
+        clamp on-screen, and paint the floating border. A popup that already fits its app
+        window (menus, dropdowns, tooltips, normal dialogs) is LEFT EXACTLY where the app
+        put it — we must never reposition an app menu (that broke Steam/VLC menu bars)."""
         mon = self.managed_monitor_for(c)
         if not mon or not mon.cells:
             return
         size = c.get("size") or [0, 0]
         if size[0] <= 0 or size[1] <= 0:
             return
-        bx, by, bw, bh = self._popup_budget(c, mon)
-        if bw <= 0 or bh <= 0 or (size[0] <= bw and size[1] <= bh):
-            return   # fits its own window/zone -> leave it (menus and small dialogs)
-        w = min(int(size[0]), int(bw))
-        h = min(int(size[1]), int(bh))
-        gx = int(bx + (bw - w) / 2)
-        gy = int(by + (bh - h) / 2)
+        aw = self._app_window(c, mon)
+        if aw and size[0] <= aw[0] and size[1] <= aw[1]:
+            return   # fits its own app window -> menu/dropdown/normal dialog, leave it
+        zx, zy, zw, zh = self._popup_zone_rect(c, mon)
+        if zw <= 0 or zh <= 0:
+            return
+        w = min(int(size[0]), int(zw))
+        h = min(int(size[1]), int(zh))
+        gx = int(zx + (zw - w) / 2)
+        gy = int(zy + (zh - h) / 2)
         ux, uy, uw, uh = mon.usable()        # keep the whole rect on-screen
         mux, muy = mon.ox + ux, mon.oy + uy
         gx = max(mux, min(gx, mux + uw - w))
         gy = max(muy, min(gy, muy + uh - h))
         hbatch(float_geom_exprs(addr, w, h, gx, gy))
-        self.paint(addr, True)               # floating (amber) border on the capped dialog
-        dlog("popup capped", addr, c.get("class"), "->", (w, h, gx, gy))
+        self.paint(addr, True)               # floating (amber) border on the fitted dialog
+        dlog("popup fit", addr, c.get("class"), "-> zone", (w, h, gx, gy))
 
     def place_deny_step(self, addr):
         """One poll toward centring a floated deny window on its cursor, instead of
