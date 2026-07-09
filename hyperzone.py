@@ -1304,6 +1304,8 @@ class Daemon(HyperZone):
             _atomic_write(MONITORS_LUA, generate_monitors_lua(specs))
         timeout_s = float(params.get("timeout_s", 15))
         self.layout_revert_at = time.time() + timeout_s
+        # push the now-applied monitor state so the UI's preview reflects reality
+        self.emit("monitors_changed", {"monitors": self.live_monitors()})
         self.emit("layout_pending", self.pending_layout_info())
         return {"deadline": self.layout_revert_at, "persisted": migrated}
 
@@ -1346,6 +1348,7 @@ class Daemon(HyperZone):
         except OSError as e:
             log("revert_layout file error", e)
         log("display layout reverted:", reason)
+        self.emit("monitors_changed", {"monitors": self.live_monitors()})
         self.emit("layout_reverted", {"reason": reason})
 
     def rpc_migrate_hyprland_config(self, params):

@@ -37,7 +37,13 @@ ColumnLayout {
       if (e) ToastService.showError("HyperZone", "Save failed: " + e)
     })
   }
-  function saveSettings() { apply() }
+  // The plugin popup's single "Apply" calls this. It saves the config AND commits
+  // display edits — but only when the displays actually changed, and never while a
+  // confirm-or-revert is already pending (that would be rejected).
+  function saveSettings() {
+    apply()
+    if (hz && hz.pendingLayout === null && displaysDirty()) applyDisplays()
+  }
 
   // ---------- config helpers ----------
   function monEntry(name) {
@@ -94,6 +100,7 @@ ColumnLayout {
   property var dispEdit: []
   property int dispRev: 0
   property int dispSel: 0
+  property string dispBaseline: "[]"   // dispSpecs() as of the last (re)load — for dirty check
 
   function reloadDisplays() {
     var ms = (hz && hz.monitors) ? hz.monitors : []
@@ -103,6 +110,7 @@ ColumnLayout {
                modes: (m.availableModes || []).slice() }
     })
     if (dispSel >= dispEdit.length) dispSel = 0
+    dispBaseline = JSON.stringify(dispSpecs())   // fresh load == not dirty
     dispRev++
   }
   function currentModeOf(m) {
@@ -114,14 +122,28 @@ ColumnLayout {
     return modes.length ? modes[0] : (pfx + (m.refreshRate || 60).toFixed(2) + "Hz")
   }
   function selDisp() { return dispEdit[dispSel] || null }
-  function setDisp(field, val) { if (dispEdit[dispSel]) { dispEdit[dispSel][field] = val; dispRev++ } }
-  function moveDisp(i, x, y) { if (dispEdit[i]) { dispEdit[i].x = x; dispEdit[i].y = y } }
-  function applyDisplays() {
-    if (!hz) return
-    hz.request("apply_monitor_layout", { timeout_s: 15, monitors: dispEdit.map(function (d) {
+  // Reassign the array (not just mutate in place) so DisplayCanvas's `monitors`
+  // binding actually changes reference and resyncs its working copy — otherwise
+  // scale/rotation/mode edits never show up in the preview.
+  function setDisp(field, val) {
+    if (!dispEdit[dispSel]) return
+    dispEdit[dispSel][field] = val
+    dispEdit = dispEdit.slice()
+    dispRev++
+  }
+  function moveDisp(i, x, y) { if (dispEdit[i]) { dispEdit[i].x = x; dispEdit[i].y = y; dispRev++ } }
+  // Normalised spec list sent to the daemon; also the basis for the dirty check.
+  function dispSpecs() {
+    return dispEdit.map(function (d) {
       return { name: d.name, mode: d.mode, x: Math.round(d.x), y: Math.round(d.y),
                scale: d.scale, transform: d.transform, disabled: d.disabled }
-    }) }, function (r, e) { if (e) ToastService.showError("HyperZone", "Apply failed: " + e) })
+    })
+  }
+  function displaysDirty() { return JSON.stringify(dispSpecs()) !== dispBaseline }
+  function applyDisplays() {
+    if (!hz) return
+    hz.request("apply_monitor_layout", { timeout_s: 15, monitors: dispSpecs() },
+               function (r, e) { if (e) ToastService.showError("HyperZone", "Display apply failed: " + e) })
   }
 
   Connections {
@@ -237,17 +259,15 @@ ColumnLayout {
         }
       }
 
-      // apply (live — no migration needed; confirm-or-revert keeps it safe)
-      NButton {
-        text: "Apply display layout"
-        enabled: root.hz && root.hz.pendingLayout === null
-        onClicked: root.applyDisplays()
-      }
+      // No per-tab apply button — the popup's single Apply commits display edits too
+      // (live, with the confirm-or-revert safety above). Just tell the user how.
       NText {
-        Layout.fillWidth: true; wrapMode: Text.WordWrap
-        visible: root.hz && !root.hz.migrated
-        text: "Display changes apply immediately, but reset when Hyprland reloads its config. " +
-              "To make them permanent, use “Persist displays” in the General tab (one-time)."
+        Layout.fillWidth: true; Layout.topMargin: Style.marginS; wrapMode: Text.WordWrap
+        text: "Press Apply at the bottom to apply display changes. They take effect immediately; " +
+              "you'll get a Keep / Revert prompt in case something goes dark." +
+              ((root.hz && !root.hz.migrated)
+                ? " Changes reset on a Hyprland reload until you use “Persist displays” in General (one-time)."
+                : "")
         pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
       }
     }
@@ -597,9 +617,12 @@ ColumnLayout {
         border.width: index === dc.selectedIndex ? 2 : 1
         radius: Style.radiusXS
         opacity: d.disabled ? 0.4 : 1
-        // Animate the settle after a drop (and any re-fit), but not the drag itself.
+        // Animate the settle after a drop (and any re-fit / scale / rotation change),
+        // but never the drag itself.
         Behavior on x { enabled: !monRect.dragging; NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
         Behavior on y { enabled: !monRect.dragging; NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
+        Behavior on width { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
+        Behavior on height { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
 
         Column {
           anchors.centerIn: parent
