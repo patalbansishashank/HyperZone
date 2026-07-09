@@ -127,6 +127,7 @@ DENY_PLACE_POLL = 0.05       # re-read a floating deny window's size this often�
 DENY_PLACE_MAX_TRIES = 12    # …until it stops changing (settled) or this many reads (~0.6s cap)
 FS_INSIST_WINDOW = 1.5       # re-fullscreen within this = app insists; stop fighting
 MON_CACHE_TTL = 1.0          # monitors-list micro-cache (also event-invalidated)
+CROSS_PLACE_TIMEOUT = 2.0    # honour a cross-monitor move's aligned-zone intent this long
 
 
 def _clampf(v, lo, hi):
@@ -895,13 +896,58 @@ class HyperZone:
         return client.get("class", "") not in DENY_CLASSES
 
     # -- placement --
+    @staticmethod
+    def rank_entry_zones(mon, rect, direction):
+        """Zone indices of `mon` ranked for a window arriving from `rect` moving
+        `direction`: closest on the PERPENDICULAR axis first (so a window from a
+        screen's top lands in the target's top, bottom→bottom), then nearest the edge
+        it enters through (moving right → left column first, moving left → right
+        column, etc). Placement fills the best EMPTY zone in this order. Rects are
+        global-logical; zone rects are monitor-local, so shift by mon.ox/oy."""
+        wx, wy, ww, wh = rect
+        wcx, wcy = wx + ww / 2.0, wy + wh / 2.0
+        ranked = []
+        for zi in range(len(mon.cells)):
+            rx, ry, rw, rh = mon.zone_rect(zi)
+            gx, gy = mon.ox + rx, mon.oy + ry
+            gcx, gcy = gx + rw / 2.0, gy + rh / 2.0
+            if direction in ("left", "right"):
+                perp = abs(gcy - wcy)
+                edge = -gx if direction == "left" else gx
+            else:
+                perp = abs(gcx - wcx)
+                edge = -gy if direction == "up" else gy
+            ranked.append((perp, edge, zi))
+        ranked.sort()
+        return [zi for _, _, zi in ranked]
+
+    def _place_ranked(self, addr, mon, ranked):
+        """Whole-fill the first EMPTY zone in `ranked`. True if placed; False if every
+        zone is occupied (caller falls back to the normal nice/overflow path)."""
+        for zi in ranked:
+            if mon.trees[zi] is None:
+                self.was_managed.discard(addr)
+                mon.trees[zi] = leaf(addr)
+                dlog("cross-place", addr, "-> zone", zi + 1, mon.name)
+                self.apply(mon)
+                return True
+        return False
+
     def place(self, addr, mon):
-        """Insert addr: (1) fill an empty zone whole, in fill order; (2) else bring
-        Zone 2 then Zone 3 to two windows (the nice 6-window layout); (3) else
-        overflow — dwindle-split the focused window, like Hyprland does."""
+        """Insert addr: (0) if it just crossed from another monitor in a direction,
+        land it in the zone spatially aligned with where it came from; (1) else fill
+        an empty zone whole, in fill order; (2) else bring Zone 2 then Zone 3 to two
+        windows (the nice 6-window layout); (3) else overflow — dwindle-split the
+        focused window, like Hyprland does."""
         if mon.has(addr):
             return
         self.was_managed.discard(addr)   # managed again -> no stale-float override due
+        # 0) honour a cross-monitor move's aligned-zone intent (see cmd_tomon)
+        order = self.cross_place.get(addr)
+        if order and order[0] == mon.name and time.time() < order[2]:
+            self.cross_place.pop(addr, None)
+            if self._place_ranked(addr, mon, order[1]):
+                return
         # 1) whole-fill the first empty zone
         for zi in mon.fill:
             if mon.trees[zi] is None:
@@ -1245,6 +1291,9 @@ class Daemon(HyperZone):
         self.pending = {}      # addr -> deadline: adopt only after it settles
         self.deny_place = {}   # addr -> [next_check, cx, cy, prev_size, tries]: centre on the
                                # cursor once the floated deny window's size stops changing
+        self.cross_place = {}  # addr -> (mon_name, ranked_zone_ids, deadline): land a window
+                               # crossing to a managed monitor in the zone aligned with where
+                               # it came from, instead of blind fill order (see cmd_tomon/place)
         self.last_rearrange = 0.0   # for debouncing rapid rearrange key-repeats
         self.stop = False           # set by the `shutdown` cmd -> loop exits cleanly
         self.stdio = False          # RPC-over-stdio mode (owned by a Noctalia plugin)
@@ -1643,6 +1692,7 @@ class Daemon(HyperZone):
                 addr = naddr(payload.strip())
                 self.pending.pop(addr, None)
                 self.deny_place.pop(addr, None)
+                self.cross_place.pop(addr, None)
                 self.remove(addr)
                 self.detached.discard(addr)
                 self.painted.discard(addr)
@@ -1693,6 +1743,8 @@ class Daemon(HyperZone):
             self.try_adopt(addr)
         for addr in [a for a, e in self.deny_place.items() if e[0] <= now]:
             self.place_deny_step(addr)
+        for addr in [a for a, o in self.cross_place.items() if o[2] <= now]:
+            self.cross_place.pop(addr, None)   # move never adopted -> drop stale intent
         if self.verify_at is not None and now >= self.verify_at:
             self.verify_at = None
             self.run_verify()
@@ -2148,6 +2200,13 @@ class Daemon(HyperZone):
         name = target.get("name", "")
         if not name:
             return
+        # If the destination is one we tile, remember which zone lines up with where
+        # the window sat, so on arrival place() lands it there (top->top, bottom->
+        # bottom) rather than in blind fill order. Unmanaged targets: Hyprland places.
+        tmon = self.mons.get(name)
+        if tmon is not None:
+            self.cross_place[addr] = (name, self.rank_entry_zones(tmon, rect, direction),
+                                      time.time() + CROSS_PLACE_TIMEOUT)
         hbatch(['hl.dsp.window.move({monitor="%s", window="address:%s"})'
                 % (name, addr)])
 
