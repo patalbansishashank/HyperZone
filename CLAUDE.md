@@ -113,6 +113,21 @@ map ids to hzctl invocations and seed the defaults.
   at the edge (`cmd_move` now returns whether it moved; `cmd_push` falls through to `cmd_tomon`).
 - `tomon` moves by **monitor name** (`hl.window.move({monitor="DP-1"})`) — moving by x/y does NOT
   reassign a floating window's output (Hyprland keeps its old monitor membership).
+- **Cross-monitor direction is WINDOW-position aware** (`pick_monitor_in_dir`): the target monitor
+  is chosen by the window's own rect with edge-adjacency + perpendicular overlap, so a window in a
+  4K screen's TOP crosses to the output beside its top and one in the bottom to the output beside
+  its bottom (the old monitor-centre pick sent both to the same place, or skipped intermediate
+  monitors). Used by `tomon`, `push`, and `focus`. Falls back to the loose centre-direction pick
+  if nothing is edge-adjacent.
+- `focus <dir>` (Super+arrows / HJKL) is layout-aware too: same-screen → native `hl.dsp.focus`
+  (instant, handles floating/groups); at the screen edge → cross to `pick_monitor_in_dir` and land
+  on the aligned `_entry_window` there (or `focus({monitor=…})` if that screen is empty). Focus
+  dispatch keys: `hl.dsp.focus({direction=…|window="address:…"|monitor="NAME"})` (it's ONE function,
+  not a namespace — `hl.dsp.focus.window` does not exist). migrate_keybinds also comments the native
+  directional-focus binds out of hyprland.lua (workspace-focus binds have `workspace=` not
+  `direction`, so they stay); it now re-scans each startup so upgrades pick up newly-owned actions.
+- `retile` (Super+Shift+R) re-snaps windows into their zones; `rearrange` (Super+Shift+T) is the
+  hard reset that also reclaims floated windows.
 
 ## Git / push
 

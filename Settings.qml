@@ -72,6 +72,9 @@ ColumnLayout {
   // KEYBIND_CMDS. The daemon sends the full current map in config.keybinds, so the
   // UI never needs the defaults except for the "reset" button below.
   readonly property var keybindGroups: [
+    { title: "Focus", desc: "Move focus by direction — layout-aware, crosses to the monitor beside the window",
+      items: [{ id: "focus-left", label: "Focus left" }, { id: "focus-right", label: "Focus right" },
+              { id: "focus-up", label: "Focus up" }, { id: "focus-down", label: "Focus down" }] },
     { title: "Move within a screen", desc: "Shuffle the focused window between zones",
       items: [{ id: "move-left", label: "Move left" }, { id: "move-right", label: "Move right" },
               { id: "move-up", label: "Move up" }, { id: "move-down", label: "Move down" }] },
@@ -81,18 +84,20 @@ ColumnLayout {
     { title: "Move across everything", desc: "Rearrange in-screen, then spill to the next monitor at the edge",
       items: [{ id: "push-left", label: "Push left" }, { id: "push-right", label: "Push right" },
               { id: "push-up", label: "Push up" }, { id: "push-down", label: "Push down" }] },
-    { title: "Actions", desc: "",
+    { title: "Actions", desc: "Re-tile re-snaps windows into their zones · Rearrange is a hard reset that also reclaims floated windows",
       items: [{ id: "toggle-float", label: "Toggle float" }, { id: "rearrange", label: "Rearrange all" },
-              { id: "retile", label: "Re-tile" }] },
+              { id: "retile", label: "Re-tile / re-snap" }] },
   ]
   readonly property var defaultKeybinds: ({
+    "focus-left": ["SUPER + left", "SUPER + H"], "focus-right": ["SUPER + right", "SUPER + L"],
+    "focus-up": ["SUPER + up", "SUPER + K"], "focus-down": ["SUPER + down", "SUPER + J"],
     "move-left": ["SUPER + CTRL + left", "SUPER + CTRL + H"], "move-right": ["SUPER + CTRL + right", "SUPER + CTRL + L"],
     "move-up": ["SUPER + CTRL + up", "SUPER + CTRL + K"], "move-down": ["SUPER + CTRL + down", "SUPER + CTRL + J"],
     "tomon-left": ["SUPER + SHIFT + left"], "tomon-right": ["SUPER + SHIFT + right"],
     "tomon-up": ["SUPER + SHIFT + up"], "tomon-down": ["SUPER + SHIFT + down"],
     "push-left": ["SUPER + CTRL + SHIFT + left"], "push-right": ["SUPER + CTRL + SHIFT + right"],
     "push-up": ["SUPER + CTRL + SHIFT + up"], "push-down": ["SUPER + CTRL + SHIFT + down"],
-    "toggle-float": ["SUPER + T"], "rearrange": ["SUPER + SHIFT + T"], "retile": []
+    "toggle-float": ["SUPER + T"], "rearrange": ["SUPER + SHIFT + T"], "retile": ["SUPER + SHIFT + R"]
   })
   function combosOf(id) { var k = edit.keybinds || {}; return (k[id] || []).slice() }
   function setCombos(id, arr) {

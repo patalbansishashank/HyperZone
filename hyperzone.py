@@ -168,6 +168,8 @@ MANAGED = {"HDMI-A-1": compile_layout(DEFAULT_LAYOUT)}
 HZCTL_CMD = "python3 -S " + os.path.join(
     os.environ.get("HOME") or os.path.expanduser("~"), ".local", "bin", "hzctl.py")
 KEYBIND_CMDS = {
+    "focus-left": "focus left", "focus-right": "focus right",
+    "focus-up": "focus up", "focus-down": "focus down",
     "move-left": "move left", "move-right": "move right",
     "move-up": "move up", "move-down": "move down",
     "tomon-left": "tomon left", "tomon-right": "tomon right",
@@ -177,6 +179,10 @@ KEYBIND_CMDS = {
     "toggle-float": "toggle-float", "rearrange": "rearrange", "retile": "retile",
 }
 DEFAULT_KEYBINDS = {
+    "focus-left": ["SUPER + left", "SUPER + H"],
+    "focus-right": ["SUPER + right", "SUPER + L"],
+    "focus-up": ["SUPER + up", "SUPER + K"],
+    "focus-down": ["SUPER + down", "SUPER + J"],
     "move-left": ["SUPER + CTRL + left", "SUPER + CTRL + H"],
     "move-right": ["SUPER + CTRL + right", "SUPER + CTRL + L"],
     "move-up": ["SUPER + CTRL + up", "SUPER + CTRL + K"],
@@ -191,13 +197,13 @@ DEFAULT_KEYBINDS = {
     "push-down": ["SUPER + CTRL + SHIFT + down"],
     "toggle-float": ["SUPER + T"],
     "rearrange": ["SUPER + SHIFT + T"],
-    "retile": [],
+    "retile": ["SUPER + SHIFT + R"],
 }
 KEYBINDS = {k: list(v) for k, v in DEFAULT_KEYBINDS.items()}
 KEYBIND_MARKER = "-- hyperzone-managed keybinds"
 # verbs whose hand-written hyprland.lua binds we take over (mouse drag-binds
 # snap-drop/float-drop are deliberately NOT in this set — they stay in hyprland.lua)
-_KB_VERBS = ("move", "tomon", "push", "toggle-float", "rearrange", "retile")
+_KB_VERBS = ("focus", "move", "tomon", "push", "toggle-float", "rearrange", "retile")
 
 
 def merge_keybinds(user):
@@ -1407,17 +1413,18 @@ class Daemon(HyperZone):
         self.active_binds = desired
 
     def migrate_keybinds(self):
-        """One-time: stop hyprland.lua from ALSO binding the keys we now own (else a
-        press fires twice). Comments out its hand-written HyperZone *keyboard* binds
-        — leaving the mouse drag-binds and every non-HyperZone bind untouched — and
-        keeps a timestamped backup. Idempotent via KEYBIND_MARKER. The already-loaded
-        running instance is deduped separately by register_keybinds(initial=True)."""
+        """Stop hyprland.lua from ALSO binding the keys we now own (else a press fires
+        twice). Comments out its hand-written HyperZone binds AND the native
+        directional-focus binds we've taken over — leaving the mouse drag-binds,
+        workspace-focus binds, and every unrelated bind untouched — keeping the
+        original as a one-time backup. Re-scans each startup (only writes when
+        something changed, and already-commented lines don't re-match), so newly
+        taken-over actions get picked up on upgrade. The already-loaded running
+        instance is deduped separately by register_keybinds(initial=True)."""
         try:
             with open(HYPRLAND_LUA) as f:
                 text = f.read()
         except OSError:
-            return
-        if KEYBIND_MARKER in text:
             return
         out, changed = [], False
         for ln in text.splitlines(keepends=True):
@@ -1426,11 +1433,15 @@ class Daemon(HyperZone):
                 changed = True
             else:
                 out.append(ln)
-        stamp = "%s  (auto-added when HyperZone took over these keybinds)\n" % KEYBIND_MARKER
-        body = stamp + "".join(out)
+        body = "".join(out)
+        if KEYBIND_MARKER not in body:
+            body = "%s  (auto-added when HyperZone took over these keybinds)\n" % KEYBIND_MARKER + body
+            changed = True
+        if not changed:
+            return
         try:
-            if changed:
-                shutil.copy2(HYPRLAND_LUA, HYPRLAND_LUA + ".hz-kb-backup")
+            if not os.path.exists(HYPRLAND_LUA + ".hz-kb-backup"):
+                shutil.copy2(HYPRLAND_LUA, HYPRLAND_LUA + ".hz-kb-backup")   # true original, once
             tmp = HYPRLAND_LUA + ".tmp"
             with open(tmp, "w") as f:
                 f.write(body)
@@ -1442,14 +1453,18 @@ class Daemon(HyperZone):
 
     @staticmethod
     def _is_hz_keyboard_bind(line):
-        """A hand-written `hl.bind(... hyperzone .. " <verb> ...")` keyboard bind we
-        take over. Matches the hzctl subcommand right after `hyperzone .. "` so mouse
-        binds (snap-drop/float-drop) and unrelated binds are left alone."""
+        """A hyprland.lua keyboard bind HyperZone now owns: either a hand-written
+        `hl.bind(... hyperzone .. " <verb> ...")` (matched by the hzctl subcommand, so
+        the mouse drag-binds are left alone) or a native DIRECTIONAL focus bind
+        `hl.bind(... hl.dsp.focus({direction=...}))` (workspace-focus binds have
+        `workspace=`, not `direction`, so they stay)."""
         s = line.strip()
-        if not s.startswith("hl.bind(") or "hyperzone" not in s or "mouse" in s:
+        if not s.startswith("hl.bind(") or "mouse" in s:
             return False
-        m = re.search(r'hyperzone\s*\.\.\s*"\s*([a-z-]+)', s)
-        return bool(m) and m.group(1) in _KB_VERBS
+        if "hyperzone" in s:
+            m = re.search(r'hyperzone\s*\.\.\s*"\s*([a-z-]+)', s)
+            return bool(m) and m.group(1) in _KB_VERBS
+        return "hl.dsp.focus(" in s and "direction" in s
 
     def rpc_retile(self, params):
         self.retile(force=True)
@@ -1868,7 +1883,7 @@ class Daemon(HyperZone):
             active = naddr(aw.get("address", "")) if aw else ""
         # args get interpolated into dispatch strings — accept only the fixed
         # vocabulary, so a malformed message can't inject or crash anything.
-        if cmd in ("move", "tomon", "push") and arg not in self.DIRECTIONS:
+        if cmd in ("move", "tomon", "push", "focus") and arg not in self.DIRECTIONS:
             log("cmd rejected: bad arg", cmd, repr(arg))
             return
         if active and not (active.startswith("0x")
@@ -1901,6 +1916,8 @@ class Daemon(HyperZone):
             self.cmd_tomon(active, arg)
         elif cmd == "push" and active:
             self.cmd_push(active, arg)
+        elif cmd == "focus" and active:
+            self.cmd_focus(active, arg)
         elif cmd == "toggle-float" and active:
             self.cmd_toggle_float(active)
             self.verify_at = time.time() + VERIFY_AFTER_CMD
@@ -2058,47 +2075,163 @@ class Daemon(HyperZone):
                     return ("zone", zi)
         return None
 
-    def cmd_tomon(self, addr, direction):
-        """Send a window to the adjacent monitor in <direction>. Pick the nearest
-        monitor that way from live logical geometry, then hand off to Hyprland by
-        monitor NAME: hl.window.move({monitor="<name>"}) actually reassigns the
-        window to that output (Hyprland re-places it on the target's active
-        workspace) and fires movewindowv2, so the daemon re-adopts it (managed) or
-        lets it dock natively (unmanaged). Moving by absolute x/y does NOT do this —
-        Hyprland keeps a floating window's monitor membership on its old output even
-        when the coordinates sit fully on another one (verified live), and a window
-        wider than the target got its centered top-left pushed back onto the source
-        monitor. Direction LETTERS ("left"/"right") also raise "Invalid monitor";
-        only the resolved output name works."""
-        mons = self.monitors_cached()
-        c = self.client(addr)
-        if not c or not mons:
-            return
-        cur = next((m for m in mons if m.get("id") == c.get("monitor")), None)
-        if not cur:
-            return
-        cx, cy, cw, ch = logical_rect(cur)
-        ccx, ccy = cx + cw / 2, cy + ch / 2
-        best = None
-        for m in mons:
-            if m.get("id") == cur.get("id") or m.get("disabled"):
+    def pick_monitor_in_dir(self, rect, direction, exclude_id):
+        """The monitor beside <rect> in <direction>, chosen by EDGE ADJACENCY from
+        the window's own position — not the source monitor's centre. A monitor
+        qualifies only if it sits on that side AND shares extent on the perpendicular
+        axis, so a window in the TOP of a tall 4K screen crosses to the output beside
+        its top, and one in the bottom crosses to the output beside its bottom (the
+        old centre-to-centre pick sent both to the same place). Ranked by gap
+        distance, then most perpendicular overlap, then nearest perpendicular centre.
+        Falls back to the loose centre-direction pick when nothing is edge-adjacent
+        (e.g. a purely diagonal neighbour), so a move never silently dies."""
+        wx, wy, ww, wh = rect
+        wr, wb, wcx, wcy = wx + ww, wy + wh, wx + ww / 2.0, wy + wh / 2.0
+        M = DIR_MARGIN_PX
+        edge, loose = [], []
+        for m in self.monitors_cached():
+            if m.get("id") == exclude_id or m.get("disabled"):
                 continue
-            x, y, w, h = logical_rect(m)
-            dx, dy = (x + w / 2) - ccx, (y + h / 2) - ccy
-            hit = {"left": dx < 0 and abs(dx) >= abs(dy),
-                   "right": dx > 0 and abs(dx) >= abs(dy),
-                   "up": dy < 0 and abs(dy) > abs(dx),
-                   "down": dy > 0 and abs(dy) > abs(dx)}[direction]
-            if hit and (best is None or dx * dx + dy * dy < best[0]):
-                best = (dx * dx + dy * dy, m)
-        if best is None:
+            mx, my, mw, mh = logical_rect(m)
+            mr, mb, mcx, mcy = mx + mw, my + mh, mx + mw / 2.0, my + mh / 2.0
+            dx, dy = mcx - wcx, mcy - wcy
+            if {"left": dx < 0 and abs(dx) >= abs(dy),
+                "right": dx > 0 and abs(dx) >= abs(dy),
+                "up": dy < 0 and abs(dy) > abs(dx),
+                "down": dy > 0 and abs(dy) > abs(dx)}[direction]:
+                loose.append((dx * dx + dy * dy, m))
+            if direction in ("left", "right"):
+                overlap = min(wb, mb) - max(wy, my)      # shared vertical extent
+                if overlap <= 0:
+                    continue
+                gap = (mx - wr) if direction == "right" else (wx - mr)
+                onside = (mx >= wr - M) if direction == "right" else (mr <= wx + M)
+                if onside:
+                    edge.append((max(0.0, gap), -overlap, abs(mcy - wcy), m))
+            else:
+                overlap = min(wr, mr) - max(wx, mx)      # shared horizontal extent
+                if overlap <= 0:
+                    continue
+                gap = (my - wb) if direction == "down" else (wy - mb)
+                onside = (my >= wb - M) if direction == "down" else (mb <= wy + M)
+                if onside:
+                    edge.append((max(0.0, gap), -overlap, abs(mcx - wcx), m))
+        if edge:
+            edge.sort(key=lambda e: e[:3])
+            return edge[0][3]
+        if loose:
+            loose.sort(key=lambda e: e[0])
+            return loose[0][1]
+        return None
+
+    def cmd_tomon(self, addr, direction):
+        """Send a window to the monitor beside IT in <direction> (see
+        pick_monitor_in_dir — the target depends on where the window sits, not just
+        which screen it's on), then hand off to Hyprland by monitor NAME:
+        hl.window.move({monitor="<name>"}) actually reassigns the window to that
+        output (Hyprland re-places it on the target's active workspace) and fires
+        movewindowv2, so the daemon re-adopts it (managed) or lets it dock natively
+        (unmanaged). Moving by absolute x/y does NOT do this — Hyprland keeps a
+        floating window's monitor membership on its old output even when the
+        coordinates sit fully on another one (verified live). Direction LETTERS
+        ("left"/"right") also raise "Invalid monitor"; only the output name works."""
+        c = self.client(addr)
+        if not c:
+            return
+        at = c.get("at") or [0, 0]
+        size = c.get("size") or [0, 0]
+        rect = (at[0], at[1], size[0], size[1])
+        target = self.pick_monitor_in_dir(rect, direction, c.get("monitor"))
+        if target is None:
             log("tomon: no monitor to the", direction)
             return
-        name = best[1].get("name", "")
+        name = target.get("name", "")
         if not name:
             return
         hbatch(['hl.dsp.window.move({monitor="%s", window="address:%s"})'
                 % (name, addr)])
+
+    def cmd_focus(self, addr, direction):
+        """Directional focus that respects the monitor layout. WITHIN a screen we
+        defer to Hyprland's native directional focus (it handles tiled/floating/
+        groups perfectly, and instantly). Only when nothing lies that way on THIS
+        screen do we cross — and then to the monitor beside the WINDOW itself
+        (pick_monitor_in_dir), landing on the window there that lines up with where
+        you came from. That fixes native focus skipping over the monitors in between
+        or crossing to the wrong one for a window in a screen's top/bottom."""
+        c = self.client(addr)
+        if not c:
+            hbatch(['hl.dsp.focus({direction="%s"})' % direction])
+            return
+        if self._same_mon_focus_target(c, direction):
+            hbatch(['hl.dsp.focus({direction="%s"})' % direction])
+            return
+        at = c.get("at") or [0, 0]
+        size = c.get("size") or [0, 0]
+        rect = (at[0], at[1], size[0], size[1])
+        target = self.pick_monitor_in_dir(rect, direction, c.get("monitor"))
+        if target is None:
+            return  # edge of the desk that way -> stay put
+        win = self._entry_window(target, rect, direction)
+        if win:
+            hbatch(['hl.dsp.focus({window="address:%s"})' % win])
+        elif target.get("name"):
+            hbatch(['hl.dsp.focus({monitor="%s"})' % target["name"]])
+
+    @staticmethod
+    def _same_mon_focus_target(c, direction):
+        """Any other mapped window on c's monitor+workspace that lies `direction` of
+        it (loose axis test). Conservative: erring toward True keeps focus native
+        rather than wrongly jumping screens."""
+        at = c.get("at") or [0, 0]
+        sz = c.get("size") or [0, 0]
+        cx, cy = at[0] + sz[0] / 2.0, at[1] + sz[1] / 2.0
+        mid = c.get("monitor")
+        ws = (c.get("workspace") or {}).get("id")
+        M = DIR_MARGIN_PX
+        for o in hjson("clients") or []:
+            if o.get("address") == c.get("address") or o.get("monitor") != mid:
+                continue
+            if (o.get("workspace") or {}).get("id") != ws or o.get("hidden"):
+                continue
+            oa, os_ = o.get("at") or [0, 0], o.get("size") or [0, 0]
+            if os_[0] <= 0 or os_[1] <= 0:
+                continue
+            ox, oy = oa[0] + os_[0] / 2.0, oa[1] + os_[1] / 2.0
+            if {"left": ox < cx - M, "right": ox > cx + M,
+                "up": oy < cy - M, "down": oy > cy + M}[direction]:
+                return True
+        return False
+
+    @staticmethod
+    def _entry_window(mon, rect, direction):
+        """Best window to land on when entering `mon` from `rect` moving `direction`:
+        on mon's active workspace, aligned with where we came from (nearest on the
+        perpendicular axis), tie-broken toward the shared edge. None if mon is empty."""
+        mid = mon.get("id")
+        awid = (mon.get("activeWorkspace") or {}).get("id")
+        wx, wy, ww, wh = rect
+        wcx, wcy = wx + ww / 2.0, wy + wh / 2.0
+        best = None
+        for o in hjson("clients") or []:
+            if o.get("monitor") != mid or o.get("hidden"):
+                continue
+            if awid is not None and (o.get("workspace") or {}).get("id") != awid:
+                continue
+            oa, os_ = o.get("at") or [0, 0], o.get("size") or [0, 0]
+            if os_[0] <= 0 or os_[1] <= 0:
+                continue
+            ox, oy = oa[0] + os_[0] / 2.0, oa[1] + os_[1] / 2.0
+            if direction in ("left", "right"):
+                perp = abs(oy - wcy)
+                edge = -ox if direction == "left" else ox   # 'left' enters mon's right edge
+            else:
+                perp = abs(ox - wcx)
+                edge = -oy if direction == "up" else oy
+            key = (perp, edge)
+            if best is None or key < best[0]:
+                best = (key, o.get("address"))
+        return best[1] if best else None
 
     def cmd_snap_drop(self, addr):
         """A window was dropped on the managed screen: snap it into the zone/space
@@ -2320,8 +2453,8 @@ def cli_fallback(cmd, arg):
         hbatch(['hl.dsp.window.float({action="toggle"})'])
 
 
-COMMANDS = ("daemon", "move", "tomon", "push", "toggle-float", "snap-drop",
-            "float-drop", "retile", "rearrange", "dump")
+COMMANDS = ("daemon", "focus", "move", "tomon", "push", "toggle-float",
+            "snap-drop", "float-drop", "retile", "rearrange", "dump")
 
 
 def main():
