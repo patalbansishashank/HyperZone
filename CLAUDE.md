@@ -156,10 +156,14 @@ map ids to hzctl invocations and seed the defaults.
   (managed set + each monitor's compiled zones/fill/nice/enabled) before vs after, and skips the
   retile entirely for keybind/deny/border edits. When it does retile, it's the gentle one. (Was an
   unconditional `retile(force=True)` on every Apply → reshuffled windows on any settings change.)
-- **Floating popups on a managed screen are capped to a zone** (`float_popup`, from `try_adopt`): a
-  fresh floating non-tileable toplevel (file/download dialogs) is resized to ≤ the zone under the
-  cursor, centred there, and painted the amber floating border. Stops huge dialogs overflowing a 4K
-  screen. Menus/tooltips are xdg-popups (not toplevels) so they never reach `try_adopt`.
+- **Oversized floating dialogs on a managed screen are capped to the APP'S OWN WINDOW** (`float_popup`
+  + `_popup_budget`, from `try_adopt`): a fresh floating popup is only touched when it's BIGGER than
+  the app's largest window on that monitor (matched by `pid`; zone under the cursor as fallback) —
+  then it's shrunk to that budget, centred on it, clamped on-screen, and given the amber border.
+  Anything that already fits its window is LEFT EXACTLY where the app put it. Critical: app menu bars
+  (Steam Friends/Games/View, VLC Media/Playback/…) DO arrive here as floating windows — an earlier
+  version that repositioned every popup flung those dropdowns to the zone centre. The size check is
+  what keeps menus (smaller than their window) untouched; never reposition a popup that fits.
 - **UI model: zones per screen (1/2/4), no managed toggle.** The settings expose a zone-count select
   (`zoneCountOf`/`setZoneCount`) — 1 = unmanaged (single zone, default Hyprland), 2/4 = tiled — instead
   of a separate "Managed" toggle. It maps onto the daemon's existing `enabled` flag (1 → enabled:false).

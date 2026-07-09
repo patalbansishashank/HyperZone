@@ -1900,35 +1900,60 @@ class Daemon(HyperZone):
                 return zi
         return None
 
+    def _popup_budget(self, c, mon):
+        """(x, y, w, h) a popup on `mon` should not exceed: the app's own LARGEST
+        window on this monitor (a dialog belongs inside its own window), or the zone
+        under the cursor when the app has no other window here. Keyed on pid so a
+        popup is measured against its parent app, never the whole screen."""
+        pid, mid = c.get("pid"), c.get("monitor")
+        best = None
+        if pid is not None:
+            for o in hjson("clients") or []:
+                if o.get("address") == c.get("address") or o.get("pid") != pid:
+                    continue
+                if o.get("monitor") != mid or o.get("hidden"):
+                    continue
+                sz, at = o.get("size") or [0, 0], o.get("at") or [0, 0]
+                area = sz[0] * sz[1]
+                if area > 0 and (best is None or area > best[0]):
+                    best = (area, at[0], at[1], sz[0], sz[1])
+        if best is not None:
+            return best[1], best[2], best[3], best[4]
+        pos = hjson("cursorpos") or {}
+        zi = self._zone_at_point(mon, pos.get("x"), pos.get("y"))
+        if zi is None:
+            sz, at = c.get("size") or [0, 0], c.get("at") or [0, 0]
+            zi = self._zone_at_point(mon, at[0] + sz[0] / 2, at[1] + sz[1] / 2)
+        rx, ry, rw, rh = mon.zone_rect(zi if zi is not None else 0)
+        return mon.ox + rx, mon.oy + ry, rw, rh
+
     def float_popup(self, addr, c):
-        """A floating dialog/popup that opened on a managed screen. Hyprland places it
-        at the app's requested size, which on a big 4K screen can overflow the monitor
-        (a download/file dialog running off the top edge). Cap it to the zone under the
-        cursor — never larger than that zone — centre it there, and paint the floating
-        border so it reads and behaves like a popup. We don't track it in a tree; it
-        stays a free-floating window that just fits its zone."""
+        """A floating dialog that opened on a managed screen BIGGER than the app window
+        it belongs to — a file/download dialog ballooning off a 4K screen. Shrink it to
+        fit that window, centre it on it, clamp on-screen, and paint the floating border
+        so it reads as a popup. A popup that already fits its window (menus, dropdowns,
+        tooltips, normal dialogs) is LEFT EXACTLY where the app put it — we must never
+        reposition an app menu (that broke Steam/VLC menu bars)."""
         mon = self.managed_monitor_for(c)
         if not mon or not mon.cells:
             return
         size = c.get("size") or [0, 0]
         if size[0] <= 0 or size[1] <= 0:
             return
-        at = c.get("at") or [0, 0]
-        pos = hjson("cursorpos") or {}
-        zi = self._zone_at_point(mon, pos.get("x"), pos.get("y"))
-        if zi is None:                    # cursor off a zone -> use the popup's own centre
-            zi = self._zone_at_point(mon, at[0] + size[0] / 2, at[1] + size[1] / 2)
-        if zi is None:
-            zi = 0
-        rx, ry, rw, rh = mon.zone_rect(zi)
-        zx, zy = mon.ox + rx, mon.oy + ry
-        w = min(int(size[0]), int(rw))
-        h = min(int(size[1]), int(rh))
-        gx = int(zx + (rw - w) / 2)
-        gy = int(zy + (rh - h) / 2)
+        bx, by, bw, bh = self._popup_budget(c, mon)
+        if bw <= 0 or bh <= 0 or (size[0] <= bw and size[1] <= bh):
+            return   # fits its own window/zone -> leave it (menus and small dialogs)
+        w = min(int(size[0]), int(bw))
+        h = min(int(size[1]), int(bh))
+        gx = int(bx + (bw - w) / 2)
+        gy = int(by + (bh - h) / 2)
+        ux, uy, uw, uh = mon.usable()        # keep the whole rect on-screen
+        mux, muy = mon.ox + ux, mon.oy + uy
+        gx = max(mux, min(gx, mux + uw - w))
+        gy = max(muy, min(gy, muy + uh - h))
         hbatch(float_geom_exprs(addr, w, h, gx, gy))
-        self.paint(addr, True)            # floating (amber) active/inactive border
-        dlog("popup->zone", addr, c.get("class"), "zone", zi + 1, "size", (w, h))
+        self.paint(addr, True)               # floating (amber) border on the capped dialog
+        dlog("popup capped", addr, c.get("class"), "->", (w, h, gx, gy))
 
     def place_deny_step(self, addr):
         """One poll toward centring a floated deny window on its cursor, instead of
