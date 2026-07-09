@@ -878,7 +878,7 @@ class HyperZone:
                 stable = self._last_size.get(addr) == (cw, ch)
                 if mismatch and not stable:
                     unsettled = True                     # still settling: read again
-                if mismatch and stable:
+                if mismatch and stable and time.time() >= self.learn_suppress_until:
                     ms = self.minsize.setdefault(cls, [0, 0])
                     for i, (got, want, zone) in enumerate(((cw, tw, rw), (ch, th, rh))):
                         if got - want > 4 and got > ms[i]:
@@ -1119,6 +1119,9 @@ class Daemon(HyperZone):
         self.layout_revert_at = None    # deadline to auto-revert a pending display layout
         self.layout_prev_specs = None   # live specs snapshotted before an apply (for exact revert)
         self.monitors_refresh_at = None # deadline for a deferred (settled) monitors_changed push
+        self.learn_suppress_until = 0.0 # no minsize learning until then (display transitions
+                                        # freeze windows at stale sizes long enough to look
+                                        # "stable" and teach garbage, e.g. a zone-wide min)
 
     # -- JSON-RPC over stdio (plugin control channel) --
     def _rpc_write(self, obj):
@@ -1303,6 +1306,7 @@ class Daemon(HyperZone):
         if migrated and os.path.exists(MONITORS_LUA):
             shutil.copyfile(MONITORS_LUA, MONITORS_LUA + ".pending-backup")
         self._apply_live_specs(specs)                       # <- takes effect now
+        self.learn_suppress_until = time.time() + 3.0       # windows are in flux
         if migrated:
             _atomic_write(MONITORS_LUA, generate_monitors_lua(specs))
         timeout_s = float(params.get("timeout_s", 15))
@@ -1345,6 +1349,7 @@ class Daemon(HyperZone):
         if prev:
             try:
                 self._apply_live_specs(prev)                # restore the actual display state
+                self.learn_suppress_until = time.time() + 3.0
             except Exception as e:
                 log("revert live-apply error", e)
         bak = MONITORS_LUA + ".pending-backup"
@@ -1437,6 +1442,8 @@ class Daemon(HyperZone):
                 # Noctalia re-creates its bar a beat after a reconfigure, changing
                 # the reserved insets; a second pass then re-anchors to the new area.
                 self.verify_at = time.time() + 1.0
+                self.learn_suppress_until = max(self.learn_suppress_until,
+                                                time.time() + 2.5)
                 self.emit("monitors_changed", {"monitors": self.live_monitors()})
         except Exception as e:
             log("on_event error", repr(line), e)
@@ -1466,6 +1473,7 @@ class Daemon(HyperZone):
             for mon in self.mons.values():
                 self.apply(mon)
             self.verify_at = now + 1.0   # bars re-anchor late; re-check insets
+            self.learn_suppress_until = max(self.learn_suppress_until, now + 2.5)
             self.emit("monitors_changed", {"monitors": self.live_monitors()})
         self.flush()                 # single coalesced geometry pass
 
