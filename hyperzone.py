@@ -1866,8 +1866,13 @@ class Daemon(HyperZone):
             # screens we touch nothing — the app keeps its own default behaviour.
             self.float_deny(addr, c)
             return
-        if mon and self.is_tileable(c) and not mon.has(addr):
-            self.place(addr, mon)
+        if mon and not mon.has(addr) and c and not c.get("fullscreen"):
+            if self.is_tileable(c):
+                self.place(addr, mon)
+            elif addr not in self.detached:
+                # a floating dialog/popup on a managed screen -> keep it inside its
+                # zone (huge file/download dialogs otherwise overflow a 4K screen).
+                self.float_popup(addr, c)
 
     def float_deny(self, addr, c):
         """Float a deny-classed window and paint it the amber floating border, then
@@ -1883,6 +1888,47 @@ class Daemon(HyperZone):
         if cx is not None:
             self.deny_place[addr] = [time.time() + DENY_PLACE_POLL, cx, cy, None, 0]
         dlog("deny-float", addr, c.get("class"), "cursor", (cx, cy))
+
+    def _zone_at_point(self, mon, px, py):
+        """Index of the zone on `mon` containing the global point (px, py), or None."""
+        if px is None or py is None:
+            return None
+        for zi in range(len(mon.cells)):
+            rx, ry, rw, rh = mon.zone_rect(zi)
+            gx, gy = mon.ox + rx, mon.oy + ry
+            if gx <= px < gx + rw and gy <= py < gy + rh:
+                return zi
+        return None
+
+    def float_popup(self, addr, c):
+        """A floating dialog/popup that opened on a managed screen. Hyprland places it
+        at the app's requested size, which on a big 4K screen can overflow the monitor
+        (a download/file dialog running off the top edge). Cap it to the zone under the
+        cursor — never larger than that zone — centre it there, and paint the floating
+        border so it reads and behaves like a popup. We don't track it in a tree; it
+        stays a free-floating window that just fits its zone."""
+        mon = self.managed_monitor_for(c)
+        if not mon or not mon.cells:
+            return
+        size = c.get("size") or [0, 0]
+        if size[0] <= 0 or size[1] <= 0:
+            return
+        at = c.get("at") or [0, 0]
+        pos = hjson("cursorpos") or {}
+        zi = self._zone_at_point(mon, pos.get("x"), pos.get("y"))
+        if zi is None:                    # cursor off a zone -> use the popup's own centre
+            zi = self._zone_at_point(mon, at[0] + size[0] / 2, at[1] + size[1] / 2)
+        if zi is None:
+            zi = 0
+        rx, ry, rw, rh = mon.zone_rect(zi)
+        zx, zy = mon.ox + rx, mon.oy + ry
+        w = min(int(size[0]), int(rw))
+        h = min(int(size[1]), int(rh))
+        gx = int(zx + (rw - w) / 2)
+        gy = int(zy + (rh - h) / 2)
+        hbatch(float_geom_exprs(addr, w, h, gx, gy))
+        self.paint(addr, True)            # floating (amber) active/inactive border
+        dlog("popup->zone", addr, c.get("class"), "zone", zi + 1, "size", (w, h))
 
     def place_deny_step(self, addr):
         """One poll toward centring a floated deny window on its cursor, instead of
