@@ -48,7 +48,8 @@ def main():
         return
     except OSError:
         pass  # daemon down -> best-effort native fallback
-    # (tomon has no fallback: this Hyprland's window.move takes no monitor target)
+    # (tomon has no fallback: picking the output in <direction> needs the daemon's
+    #  live monitor geometry — see Daemon.cmd_tomon)
     if cmd == "move":
         dispatch('hl.dsp.window.move({direction="%s"})' % arg)
     elif cmd == "toggle-float":

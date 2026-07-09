@@ -1890,12 +1890,17 @@ class Daemon(HyperZone):
         return None
 
     def cmd_tomon(self, addr, direction):
-        """Send a window to the adjacent monitor in <direction>. This Hyprland's
-        hl.window.move accepts only direction/x+y/workspace/group args — no monitor
-        target (direction letters raise "Invalid monitor", and the workspace form
-        silently no-ops for an addressed window; both verified live). So teleport
-        by absolute x/y into the target monitor; the movewindowv2 that follows
-        makes the daemon re-adopt (managed) or dock it natively (unmanaged)."""
+        """Send a window to the adjacent monitor in <direction>. Pick the nearest
+        monitor that way from live logical geometry, then hand off to Hyprland by
+        monitor NAME: hl.window.move({monitor="<name>"}) actually reassigns the
+        window to that output (Hyprland re-places it on the target's active
+        workspace) and fires movewindowv2, so the daemon re-adopts it (managed) or
+        lets it dock natively (unmanaged). Moving by absolute x/y does NOT do this —
+        Hyprland keeps a floating window's monitor membership on its old output even
+        when the coordinates sit fully on another one (verified live), and a window
+        wider than the target got its centered top-left pushed back onto the source
+        monitor. Direction LETTERS ("left"/"right") also raise "Invalid monitor";
+        only the resolved output name works."""
         mons = self.monitors_cached()
         c = self.client(addr)
         if not c or not mons:
@@ -1916,16 +1921,15 @@ class Daemon(HyperZone):
                    "up": dy < 0 and abs(dy) > abs(dx),
                    "down": dy > 0 and abs(dy) > abs(dx)}[direction]
             if hit and (best is None or dx * dx + dy * dy < best[0]):
-                best = (dx * dx + dy * dy, m, x, y, w, h)
+                best = (dx * dx + dy * dy, m)
         if best is None:
             log("tomon: no monitor to the", direction)
             return
-        _, tm, tx, ty, tw, th = best
-        sw, sh = (c.get("size") or [800, 600])
-        gx = int(tx + (tw - sw) / 2)
-        gy = int(ty + (th - sh) / 2)
-        hbatch(['hl.dsp.window.move({x=%d,y=%d, window="address:%s"})'
-                % (gx, gy, addr)])
+        name = best[1].get("name", "")
+        if not name:
+            return
+        hbatch(['hl.dsp.window.move({monitor="%s", window="address:%s"})'
+                % (name, addr)])
 
     def cmd_snap_drop(self, addr):
         """A window was dropped on the managed screen: snap it into the zone/space
@@ -2135,8 +2139,8 @@ def send(cmd, arg=None):
 
 def cli_fallback(cmd, arg):
     """If the daemon is down, degrade to a sensible native action (never hang).
-    tomon has no fallback: this Hyprland's window.move takes no monitor target
-    (see Daemon.cmd_tomon), and the daemon's geometry teleport needs its state."""
+    tomon has no fallback: resolving which output lies in <direction> needs the
+    daemon's live monitor geometry (see Daemon.cmd_tomon)."""
     if cmd == "move":
         hbatch(['hl.dsp.window.move({direction="%s"})' % arg])
     elif cmd == "toggle-float":
