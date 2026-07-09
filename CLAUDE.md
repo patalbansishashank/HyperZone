@@ -139,13 +139,18 @@ map ids to hzctl invocations and seed the defaults.
   top even when the top is full and the bottom is EMPTY (and bottom stays bottom), never the
   nice/overflow default that fills the top first. Expires after `CROSS_PLACE_TIMEOUT`; pruned in
   `tick()` and on closewindow.
-- `focus <dir>` (Super+arrows / HJKL) is layout-aware too: same-screen → native `hl.dsp.focus`
-  (instant, handles floating/groups); at the screen edge → cross to `pick_monitor_in_dir` and land
-  on the aligned `_entry_window` there (or `focus({monitor=…})` if that screen is empty). Focus
-  dispatch keys: `hl.dsp.focus({direction=…|window="address:…"|monitor="NAME"})` (it's ONE function,
-  not a namespace — `hl.dsp.focus.window` does not exist). migrate_keybinds also comments the native
-  directional-focus binds out of hyprland.lua (workspace-focus binds have `workspace=` not
-  `direction`, so they stay); it now re-scans each startup so upgrades pick up newly-owned actions.
+- `focus <dir>` (Super+arrows / HJKL) is FULLY geometric — computed fresh per press by
+  `_focus_target` over every visible window on every monitor, NO native `focus({direction})`
+  delegation (native is centre-based and wraps; it jumped into subdivisions and wrapped at edges).
+  Ranking: aligned (perpendicular overlap) beats unaligned at any distance → nearest primary-axis
+  centre → most in-line. "In that direction" = candidate centre beyond MY EDGE (not my centre) —
+  else a top-right subdivision horizontally inside a wide bottom window counts as "right" of it.
+  No wrap; empty screens skipped (focus only lands on windows); desk edge = stay put; no active
+  window (stranded on an empty screen) = `cmd_focus_from_cursor` recovery. Focus dispatch keys:
+  `hl.dsp.focus({direction=…|window="address:…"|monitor="NAME"})` (ONE function, not a namespace —
+  `hl.dsp.focus.window` does not exist). migrate_keybinds also comments the native directional-focus
+  binds out of hyprland.lua (workspace-focus binds have `workspace=` not `direction`, so they stay);
+  it re-scans each startup so upgrades pick up newly-owned actions.
 - **retile is gentle; rearrange is the reset.** `retile(force=False)` (Re-tile button, Super+Shift+R,
   and config Apply) KEEPS the current arrangement — `reseed()` preserves each tracked window's zone
   and retile only re-asserts geometry (undo drift) + adopts untracked windows. It must NOT wipe the
