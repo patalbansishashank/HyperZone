@@ -122,7 +122,8 @@ LEARN_SUPPRESS_APPLY = 3.0   # no minsize learning around a display apply/revert
 LEARN_SUPPRESS_RESEED = 2.5  # ... or around a reseed/config reload
 REVERT_TIMEOUT = 15.0        # confirm-or-revert deadline for display changes
 REARRANGE_DEBOUNCE = 0.3     # ignore rearrange key-repeats inside this window
-DENY_PLACE_DELAY = 0.2       # let a floated deny window settle to natural size, then place it
+DENY_PLACE_POLL = 0.05       # re-read a floating deny window's size this often…
+DENY_PLACE_MAX_TRIES = 12    # …until it stops changing (settled) or this many reads (~0.6s cap)
 FS_INSIST_WINDOW = 1.5       # re-fullscreen within this = app insists; stop fighting
 MON_CACHE_TTL = 1.0          # monitors-list micro-cache (also event-invalidated)
 
@@ -1171,7 +1172,8 @@ class Daemon(HyperZone):
         super().__init__()
         self.sel = selectors.DefaultSelector()
         self.pending = {}      # addr -> deadline: adopt only after it settles
-        self.deny_place = {}   # addr -> (deadline, cx, cy): centre a floated deny window on the cursor once settled
+        self.deny_place = {}   # addr -> [next_check, cx, cy, prev_size, tries]: centre on the
+                               # cursor once the floated deny window's size stops changing
         self.last_rearrange = 0.0   # for debouncing rapid rearrange key-repeats
         self.stop = False           # set by the `shutdown` cmd -> loop exits cleanly
         self.stdio = False          # RPC-over-stdio mode (owned by a Noctalia plugin)
@@ -1521,9 +1523,8 @@ class Daemon(HyperZone):
         for addr in [a for a, t in self.pending.items() if t <= now]:
             self.pending.pop(addr, None)
             self.try_adopt(addr)
-        for addr in [a for a, (t, _, _) in self.deny_place.items() if t <= now]:
-            _, cx, cy = self.deny_place.pop(addr)
-            self.place_deny(addr, cx, cy)
+        for addr in [a for a, e in self.deny_place.items() if e[0] <= now]:
+            self.place_deny_step(addr)
         if self.verify_at is not None and now >= self.verify_at:
             self.verify_at = None
             self.run_verify()
@@ -1549,7 +1550,7 @@ class Daemon(HyperZone):
         if self.dirty or self.reconcile_needed:
             return 0.0
         deadlines = list(self.pending.values())
-        deadlines += [t for (t, _, _) in self.deny_place.values()]
+        deadlines += [e[0] for e in self.deny_place.values()]
         if self.verify_at is not None:
             deadlines.append(self.verify_at)
         if self.layout_revert_at is not None:
@@ -1571,13 +1572,13 @@ class Daemon(HyperZone):
             self.remove(addr, stale)
         self.detached.discard(addr)
         c = self.client(addr)
-        if c and c.get("class", "") in DENY_CLASSES:
-            # never-tile: float it near the cursor with the amber floating border,
-            # whether it opened tiled (Hyprland grabbed it) or self-floated at some
-            # default spot — so it always behaves like the utility window it is.
+        mon = self.managed_monitor_for(c)
+        if mon and c and c.get("class", "") in DENY_CLASSES:
+            # never-tile, but ONLY on a screen we manage: float it near the cursor
+            # with the amber floating border so it doesn't get tiled. On unmanaged
+            # screens we touch nothing — the app keeps its own default behaviour.
             self.float_deny(addr, c)
             return
-        mon = self.managed_monitor_for(c)
         if mon and self.is_tileable(c) and not mon.has(addr):
             self.place(addr, mon)
 
@@ -1586,26 +1587,46 @@ class Daemon(HyperZone):
         centre it on the cursor. Positioning is DEFERRED: on a managed screen the
         window first maps at a tiled (near-full-monitor) size, so centring on that
         now would fling it into a corner. Float it, let it settle to its natural
-        size, then place_deny() re-reads that size and centres it under the cursor."""
+        size, then place_deny_step() re-reads that size and centres it on the cursor."""
         pos = hjson("cursorpos") or {}
         cx, cy = pos.get("x"), pos.get("y")
         hbatch(['hl.dsp.window.float({action="enable", window="address:%s"})' % addr])
         self.paint(addr, True)   # amber active/inactive floating border
         self.save()              # persist the paint flag
         if cx is not None:
-            self.deny_place[addr] = (time.time() + DENY_PLACE_DELAY, cx, cy)
+            self.deny_place[addr] = [time.time() + DENY_PLACE_POLL, cx, cy, None, 0]
         dlog("deny-float", addr, c.get("class"), "cursor", (cx, cy))
 
-    def place_deny(self, addr, cx, cy):
-        """Centre a now-floated deny window on (cx, cy), clamped to its monitor.
-        Runs after the window has settled to its natural (not tiled) size."""
+    def place_deny_step(self, addr):
+        """One poll toward centring a floated deny window on its cursor, instead of
+        guessing a fixed delay. The window first maps at a tiled (near-full-monitor)
+        size, so we place only once it is (a) no longer filling the monitor AND
+        (b) stable between two reads — or a bounded number of reads as a backstop.
+        Just 'stable' isn't enough: the tiled size is itself stable for a frame or
+        two before the window shrinks to its natural size. Reschedules until then."""
+        e = self.deny_place.get(addr)
+        if not e:
+            return
+        _, cx, cy, prev, tries = e
         c = self.client(addr)
         if not c or not c.get("floating"):
+            self.deny_place.pop(addr, None)      # gone or re-tiled: give up
             return
-        sw, sh = (c.get("size") or [800, 600])
-        gx, gy = self._clamp_to_monitor(c, int(cx - sw / 2), int(cy - sh / 2), sw, sh)
-        hbatch(['hl.dsp.window.move({x=%d,y=%d, window="address:%s"})' % (gx, gy, addr)])
-        dlog("deny-place", addr, "->", (gx, gy), "size", (sw, sh))
+        size = tuple(c.get("size") or [0, 0])
+        mon = next((m for m in self.monitors_cached() if m.get("id") == c.get("monitor")), None)
+        tiled_ish = False
+        if mon:
+            _, _, mw, mh = logical_rect(mon)
+            tiled_ish = size[0] >= 0.9 * mw and size[1] >= 0.9 * mh
+        settled = size[0] > 0 and not tiled_ish and size == prev
+        if settled or tries >= DENY_PLACE_MAX_TRIES:
+            sw, sh = size if size[0] > 0 else (800, 600)
+            gx, gy = self._clamp_to_monitor(c, int(cx - sw / 2), int(cy - sh / 2), sw, sh)
+            hbatch(['hl.dsp.window.move({x=%d,y=%d, window="address:%s"})' % (gx, gy, addr)])
+            self.deny_place.pop(addr, None)
+            dlog("deny-place", addr, "->", (gx, gy), "size", (sw, sh), "tries", tries)
+        else:
+            e[0], e[3], e[4] = time.time() + DENY_PLACE_POLL, size, tries + 1
 
     def _clamp_to_monitor(self, c, x, y, w, h):
         """Keep a (w,h) window fully on the monitor the client is on."""
