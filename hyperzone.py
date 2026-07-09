@@ -289,12 +289,14 @@ def lua_monitor(spec):
     same hl.monitor the config would). Instant, no reload, no migration needed."""
     if spec.get("disabled"):
         return 'hl.monitor({output="%s", mode="disable"})' % spec["name"]
+    # transform is ALWAYS emitted: at eval time an omitted key means "keep the
+    # monitor's current value", so leaving out transform=0 made it impossible to
+    # rotate a screen back to normal (verified live: 1 stayed 1 without the key).
     parts = ['output="%s"' % spec["name"],
              'mode="%s"' % str(spec.get("mode", "preferred")).replace("Hz", ""),
              'position="%dx%d"' % (int(spec.get("x", 0)), int(spec.get("y", 0))),
-             'scale="%s"' % spec.get("scale", 1)]
-    if int(spec.get("transform", 0)):
-        parts.append("transform=%d" % int(spec["transform"]))
+             'scale="%s"' % spec.get("scale", 1),
+             "transform=%d" % int(spec.get("transform", 0))]
     return "hl.monitor({%s})" % ", ".join(parts)
 
 
@@ -1457,6 +1459,13 @@ class Daemon(HyperZone):
             self.revert_layout("timeout")   # nobody confirmed -> auto-restore
         if self.monitors_refresh_at is not None and now >= self.monitors_refresh_at:
             self.monitors_refresh_at = None
+            # A live `eval hl.monitor` apply fires NO configreloaded event, so the
+            # tiler must re-learn monitor geometry here or zones go stale (windows
+            # tile against pre-rotation/pre-move rectangles).
+            self.reseed()
+            for mon in self.mons.values():
+                self.apply(mon)
+            self.verify_at = now + 1.0   # bars re-anchor late; re-check insets
             self.emit("monitors_changed", {"monitors": self.live_monitors()})
         self.flush()                 # single coalesced geometry pass
 
@@ -1598,9 +1607,7 @@ class Daemon(HyperZone):
         elif cmd == "move" and active:
             self.cmd_move(active, arg)
         elif cmd == "tomon" and active:
-            # l/r/u/d; daemon then gets movewindowv2 and reflows / re-adopts
-            hbatch(['hl.dsp.window.move({monitor="%s", window="address:%s"})'
-                    % (arg[0], active)])
+            self.cmd_tomon(active, arg)
         elif cmd == "toggle-float" and active:
             self.cmd_toggle_float(active)
             self.verify_at = time.time() + 0.45
@@ -1746,6 +1753,52 @@ class Daemon(HyperZone):
                 if gx <= cx < gx + rw and gy <= cy < gy + rh:
                     return ("zone", zi)
         return None
+
+    def cmd_tomon(self, addr, direction):
+        """Send a window to the adjacent monitor in <direction>. This Hyprland's
+        hl.window.move accepts only direction/x+y/workspace/group args — no monitor
+        target (direction letters raise "Invalid monitor", and the workspace form
+        silently no-ops for an addressed window; both verified live). So teleport
+        by absolute x/y into the target monitor; the movewindowv2 that follows
+        makes the daemon re-adopt (managed) or dock it natively (unmanaged)."""
+        mons = hjson("monitors") or []
+        c = self.client(addr)
+        if not c or not mons:
+            return
+
+        def rect(m):   # logical rect (scale + rotation aware)
+            w = m["width"] / float(m.get("scale") or 1)
+            h = m["height"] / float(m.get("scale") or 1)
+            if int(m.get("transform", 0)) % 2:
+                w, h = h, w
+            return m["x"], m["y"], w, h
+
+        cur = next((m for m in mons if m.get("id") == c.get("monitor")), None)
+        if not cur:
+            return
+        cx, cy, cw, ch = rect(cur)
+        ccx, ccy = cx + cw / 2, cy + ch / 2
+        best = None
+        for m in mons:
+            if m.get("id") == cur.get("id") or m.get("disabled"):
+                continue
+            x, y, w, h = rect(m)
+            dx, dy = (x + w / 2) - ccx, (y + h / 2) - ccy
+            hit = {"left": dx < 0 and abs(dx) >= abs(dy),
+                   "right": dx > 0 and abs(dx) >= abs(dy),
+                   "up": dy < 0 and abs(dy) > abs(dx),
+                   "down": dy > 0 and abs(dy) > abs(dx)}[direction]
+            if hit and (best is None or dx * dx + dy * dy < best[0]):
+                best = (dx * dx + dy * dy, m, x, y, w, h)
+        if best is None:
+            log("tomon: no monitor to the", direction)
+            return
+        _, tm, tx, ty, tw, th = best
+        sw, sh = (c.get("size") or [800, 600])
+        gx = int(tx + (tw - sw) / 2)
+        gy = int(ty + (th - sh) / 2)
+        hbatch(['hl.dsp.window.move({x=%d,y=%d, window="address:%s"})'
+                % (gx, gy, addr)])
 
     def cmd_snap_drop(self, addr):
         """A window was dropped on the managed screen: snap it into the zone/space
