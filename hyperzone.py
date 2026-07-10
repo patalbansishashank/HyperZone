@@ -1783,6 +1783,12 @@ class Daemon(HyperZone):
                     self.paint(a, True)
                 for mon in self.mons.values():
                     self.apply(mon)
+                # A reload rebuilds Hyprland's bind table from hyprland.lua (where our
+                # binds are commented out), silently wiping every runtime `hl.bind` we
+                # added via eval. Re-register so the shortcuts survive any `hyprctl
+                # reload` -- but not mid-record, or we'd clobber the capture.
+                if self.capture_resume_at is None:
+                    self.register_keybinds(initial=True)
                 # Noctalia re-creates its bar a beat after a reconfigure, changing
                 # the reserved insets; a second pass then re-anchors to the new area.
                 self.verify_at = time.time() + VERIFY_AFTER_RELOAD
