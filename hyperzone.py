@@ -797,6 +797,28 @@ class HyperZone:
             return max(rw, ms[0]), max(rh, ms[1])
         return rw, rh
 
+    def reprobe_min(self, addr):
+        """Forget an app's learned min-size when the user DELIBERATELY repositions
+        the window, so the next placement re-measures against its new zone.
+
+        The min is learned from a window's settled size (run_verify), which can latch
+        onto a ONE-TIME size the app isn't actually pinned to -- e.g. VLC resizes
+        itself to the video's native width the instant it loads, right as we're
+        measuring it. That gets recorded as a hard minimum, and because want_size then
+        always commands max(zone, min), the app is never again asked to go smaller, so
+        the self-correction in run_verify can't fire: the stale min sticks forever and
+        every placement into a narrower zone overflows it.
+
+        A deliberate move (drag-drop, Super+arrow) means the app is done loading and
+        the user wants it in THIS zone -- the moment to re-test. Drop the record; if a
+        genuine minimum exists, verify simply re-learns it from the new settled size."""
+        c = self.client(addr)
+        cls = (c or {}).get("class")
+        if cls and cls in self.minsize:
+            self.minsize.pop(cls, None)
+            self.save()
+            dlog("reprobe min: cleared", cls)
+
     def paint(self, addr, floating):
         """Outline addr: amber if free-floating, config colour if managed. Only ever
         repaints a window we previously painted (self.painted), so windows we never
@@ -2201,9 +2223,11 @@ class Daemon(HyperZone):
             return False  # nothing in that direction: at the edge, stay put
         if best[1] == "swap":
             my_leaf["win"], best[2]["win"] = best[2]["win"], my_leaf["win"]
+            self.reprobe_min(my_leaf["win"])    # the swapped-in window changed zone too
         else:                                   # move into the empty zone (whole)
             mon.trees[my_zi] = remove_win(mon.trees[my_zi], addr)
             mon.trees[best[2]] = leaf(addr)
+        self.reprobe_min(addr)                  # re-measure in its new zone
         self.apply(mon)
         return True
 
@@ -2362,6 +2386,7 @@ class Daemon(HyperZone):
         if tmon is not None:
             self.cross_place[addr] = (name, self.rank_entry_zones(tmon, rect, direction),
                                       time.time() + CROSS_PLACE_TIMEOUT)
+        self.reprobe_min(addr)                  # re-measure against the target zone
         hbatch(['hl.dsp.window.move({monitor="%s", window="address:%s"})'
                 % (name, addr)])
 
@@ -2510,6 +2535,7 @@ class Daemon(HyperZone):
             return  # dropped on an unmanaged screen -> leave it to Hyprland
         self.detached.discard(addr)
         self.was_managed.discard(addr)   # managed again -> no stale-float override due
+        self.reprobe_min(addr)           # deliberate drop -> re-measure min in new zone
         tgt = self.drop_target(mon, skip_addr=addr)   # read cursor BEFORE removing
         if tgt is None and mon.has(addr):
             # dropped on its own space (or a click) -> snap it back into its zone
