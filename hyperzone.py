@@ -715,13 +715,30 @@ def remove_win(node, addr):
 
 
 # ───────────────────────── monitor state ─────────────────────────
+def mon_identity(info):
+    """A monitor's STABLE identity, independent of its DRM connector name
+    (HDMI-A-1, …). Connector names are assigned per GPU-enumeration order, so they
+    migrate to a different physical port whenever the GPU set changes — which is
+    exactly what made a zone layout jump to the wrong screen. We key on Hyprland's
+    `description` (EDID make + model + serial) — the SAME identity the generated
+    monitors.lua uses via desc:. Falls back to make/model/serial, then the connector
+    name, when no description is exposed."""
+    d = str(info.get("description") or "").strip()
+    if d:
+        return d
+    mms = " ".join(str(info.get(k) or "").strip()
+                   for k in ("make", "model", "serial")).strip()
+    return mms or info.get("name")
+
+
 class Monitor:
     """A managed monitor is a fixed set of zones, each holding a BSP tree of
     windows. Zones fill whole first (fill order); Zone 2 and Zone 3 then split
     once (nice order); any further window dwindle-splits the focused leaf."""
 
-    def __init__(self, name, cfg, info):
+    def __init__(self, name, cfg, info, ident=None):
         self.name = name
+        self.ident = ident if ident is not None else mon_identity(info)
         self.cells = cfg["cells"]
         self.fill = cfg["fill"]
         self.nice = cfg["nice"]
@@ -873,17 +890,31 @@ class HyperZone:
 
     def reseed(self):
         self.invalidate_monitors()
-        info = {m["name"]: m for m in self.monitors_cached()}
-        # keep existing slot occupants where the monitor still exists
-        old = self.mons
+        live = self.monitors_cached()
+        # Resolve each managed config entry to a live monitor by STABLE IDENTITY
+        # (EDID make/model/serial) first, falling back to the DRM connector name for
+        # legacy name-keyed configs. Identity keying means a zone layout follows its
+        # physical panel across connector-name churn (a GPU added/removed renames
+        # ports) instead of hijacking whatever screen now answers to the old name.
+        by_ident, by_name = {}, {}
+        for m in live:
+            by_ident.setdefault(mon_identity(m), m)
+            by_name.setdefault(m["name"], m)
+        old = {mon.ident: mon for mon in self.mons.values()}   # preserve by identity
         self.mons = {}
-        for name, cfg in MANAGED.items():
-            if name in info and cfg.get("enabled", True):   # skip toggled-off monitors
-                mon = Monitor(name, cfg, info[name])
-                if name in old and len(old[name].trees) == len(mon.trees):
-                    mon.trees = old[name].trees     # preserve layout on reseed
-                self.mons[name] = mon
-        dlog("reseed managed:", list(self.mons))
+        for key, cfg in MANAGED.items():
+            if not cfg.get("enabled", True):        # skip toggled-off monitors
+                continue
+            info = by_ident.get(key) or by_name.get(key)
+            if info is None:                        # that monitor isn't connected now
+                continue
+            ident = mon_identity(info)
+            mon = Monitor(info["name"], cfg, info, ident)
+            prev = old.get(ident)
+            if prev is not None and len(prev.trees) == len(mon.trees):
+                mon.trees = prev.trees              # keep layout across reseed / rename
+            self.mons[info["name"]] = mon
+        dlog("reseed managed:", {n: m.ident for n, m in self.mons.items()})
 
     def mon_of_addr(self, addr):
         for mon in self.mons.values():
@@ -1437,8 +1468,11 @@ class Daemon(HyperZone):
             name = m.get("name")
             if not name:
                 continue
-            if name in user_managed:
-                entry = dict(user_managed[name])
+            # config.json is keyed by stable identity; the name-keyed UI wants this
+            # monitor's entry looked up by identity (with a legacy name key fallback).
+            saved = user_managed.get(mon_identity(m), user_managed.get(name))
+            if saved is not None:
+                entry = dict(saved)
                 entry.setdefault("enabled", True)
             else:   # not user-configured: managed only if the built-in default is
                 builtin = (not user_managed and name in MANAGED
@@ -1496,11 +1530,27 @@ class Daemon(HyperZone):
                        tuple(m.get("fill", ())), tuple(m.get("nice", ())))
                 for name, m in MANAGED.items()}
 
+    def _managed_by_identity(self, managed):
+        """Rewrite a UI-supplied managed map (keyed by connector name) to be keyed by
+        stable monitor identity, so it survives connector-name churn. Resolves each
+        key against the CURRENT live monitors (correct because the UI is editing the
+        current topology): a connector name -> that monitor's identity; a key that is
+        already an identity, or names a disconnected monitor, is kept as-is."""
+        name2ident = {m["name"]: mon_identity(m) for m in self.live_monitors()}
+        idents = set(name2ident.values())
+        out = {}
+        for key, mc in managed.items():
+            out[key if key in idents else name2ident.get(key, key)] = mc
+        return out
+
     def rpc_set_config(self, params):
         global USER_CONFIG
         cfg = params.get("config")
         if not isinstance(cfg, dict):
             raise ValueError("missing/invalid config")
+        if isinstance(cfg.get("managed"), dict):
+            cfg = dict(cfg)                       # persist identity-keyed, not by port
+            cfg["managed"] = self._managed_by_identity(cfg["managed"])
         old_sig = self._tiling_sig()
         apply_config(cfg)              # validates first -> globals untouched on error
         self._write_config(cfg)
