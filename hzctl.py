@@ -11,7 +11,7 @@ Startup cost is the whole latency of a keypress, so imports are kept minimal
 (no json — the message is hand-built; subprocess only on the fallback path).
 Run with `python3 -S` to skip site-packages for a few more ms.
 
-Usage: hzctl.py <move|tomon|toggle-float|snap-drop|float-drop|rearrange|retile|dump> [arg]
+Usage: hzctl.py <focus|move|tomon|push|swap|toggle-float|snap-drop|float-drop|rearrange|retile|dump> [arg]
 """
 import os
 import socket
@@ -20,7 +20,7 @@ import sys
 SOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hyperzone.sock")
 # fixed vocabulary only: the message below is hand-built (no json import for
 # startup speed), which is safe exactly because these are the only values.
-COMMANDS = ("focus", "move", "tomon", "push", "toggle-float", "snap-drop",
+COMMANDS = ("focus", "move", "tomon", "push", "swap", "toggle-float", "snap-drop",
             "float-drop", "retile", "rearrange", "dump")
 ARGS = (None, "left", "right", "up", "down")
 

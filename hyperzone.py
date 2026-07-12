@@ -178,6 +178,8 @@ KEYBIND_CMDS = {
     "tomon-up": "tomon up", "tomon-down": "tomon down",
     "push-left": "push left", "push-right": "push right",
     "push-up": "push up", "push-down": "push down",
+    "swap-left": "swap left", "swap-right": "swap right",
+    "swap-up": "swap up", "swap-down": "swap down",
     "toggle-float": "toggle-float", "rearrange": "rearrange", "retile": "retile",
 }
 DEFAULT_KEYBINDS = {
@@ -197,6 +199,10 @@ DEFAULT_KEYBINDS = {
     "push-right": ["SUPER + CTRL + SHIFT + right"],
     "push-up": ["SUPER + CTRL + SHIFT + up"],
     "push-down": ["SUPER + CTRL + SHIFT + down"],
+    "swap-left": ["SUPER + ALT + left"],
+    "swap-right": ["SUPER + ALT + right"],
+    "swap-up": ["SUPER + ALT + up"],
+    "swap-down": ["SUPER + ALT + down"],
     "toggle-float": ["SUPER + T"],
     "rearrange": ["SUPER + SHIFT + T"],
     "retile": ["SUPER + SHIFT + R"],
@@ -205,7 +211,7 @@ KEYBINDS = {k: list(v) for k, v in DEFAULT_KEYBINDS.items()}
 KEYBIND_MARKER = "-- hyperzone-managed keybinds"
 # verbs whose hand-written hyprland.lua binds we take over (mouse drag-binds
 # snap-drop/float-drop are deliberately NOT in this set — they stay in hyprland.lua)
-_KB_VERBS = ("focus", "move", "tomon", "push", "toggle-float", "rearrange", "retile")
+_KB_VERBS = ("focus", "move", "tomon", "push", "swap", "toggle-float", "rearrange", "retile")
 
 
 def merge_keybinds(user):
@@ -1341,6 +1347,9 @@ class Daemon(HyperZone):
         self.cross_place = {}  # addr -> (mon_name, ranked_zone_ids, deadline): land a window
                                # crossing to a managed monitor in the zone aligned with where
                                # it came from, instead of blind fill order (see cmd_tomon/place)
+        self.swap_pending = set()  # addrs mid cross-monitor SWAP: force on_moved to adopt them
+                               # onto their destination even though we pre-emptied their source
+                               # tree slot (so is_tileable/was_ours are both false). See cmd_swap.
         self.last_rearrange = 0.0   # for debouncing rapid rearrange key-repeats
         self.stop = False           # set by the `shutdown` cmd -> loop exits cleanly
         self.stdio = False          # RPC-over-stdio mode (owned by a Noctalia plugin)
@@ -1777,6 +1786,7 @@ class Daemon(HyperZone):
                 self.pending.pop(addr, None)
                 self.deny_place.pop(addr, None)
                 self.cross_place.pop(addr, None)
+                self.swap_pending.discard(addr)
                 self.remove(addr)
                 self.detached.discard(addr)
                 self.painted.discard(addr)
@@ -1835,6 +1845,7 @@ class Daemon(HyperZone):
             self.place_deny_step(addr)
         for addr in [a for a, o in self.cross_place.items() if o[2] <= now]:
             self.cross_place.pop(addr, None)   # move never adopted -> drop stale intent
+            self.swap_pending.discard(addr)    # (also clears a swap that never landed)
         if self.capture_resume_at is not None and now >= self.capture_resume_at:
             self.capture_resume_at = None      # UI never resumed -> restore keybinds
             self.register_keybinds(initial=True)
@@ -2065,9 +2076,15 @@ class Daemon(HyperZone):
         # (those stay floating because we float them). Do NOT adopt an app-floated
         # window (a dialog/popup that merely emitted a move event) — that grabbed
         # popups and half-tiled them at the wrong size/place.
+        # A cross-monitor swap participant: we emptied its old zone up front (so the
+        # window arriving from the other screen finds a clean slot), which makes both
+        # is_tileable (it's floating) and was_ours (no longer in any tree) false — so
+        # force the adoption here, then clear the flag.
+        force = addr in self.swap_pending
         if cur and not cur.has(addr) and c and not c.get("fullscreen") \
-                and (self.is_tileable(c) or was_ours):
+                and (self.is_tileable(c) or was_ours or force):
             self.place(addr, cur)
+        self.swap_pending.discard(addr)
 
     def reconcile_fullscreen(self):
         clients = hjson("clients") or []
@@ -2109,7 +2126,7 @@ class Daemon(HyperZone):
             active = naddr(aw.get("address", "")) if aw else ""
         # args get interpolated into dispatch strings — accept only the fixed
         # vocabulary, so a malformed message can't inject or crash anything.
-        if cmd in ("move", "tomon", "push", "focus") and arg not in self.DIRECTIONS:
+        if cmd in ("move", "tomon", "push", "swap", "focus") and arg not in self.DIRECTIONS:
             log("cmd rejected: bad arg", cmd, repr(arg))
             return
         if active and not (active.startswith("0x")
@@ -2142,6 +2159,8 @@ class Daemon(HyperZone):
             self.cmd_tomon(active, arg)
         elif cmd == "push" and active:
             self.cmd_push(active, arg)
+        elif cmd == "swap" and active:
+            self.cmd_swap(active, arg)
         elif cmd == "focus":
             if active:
                 self.cmd_focus(active, arg)
@@ -2238,6 +2257,92 @@ class Daemon(HyperZone):
         whole desk (in-screen rearrange + cross-screen handoff)."""
         if not self.cmd_move(addr, direction):
             self.cmd_tomon(addr, direction)
+
+    def cmd_swap(self, addr, direction):
+        """Swap the focused window with whatever window lies in `direction` — the
+        very target directional focus would jump to (_focus_target), so it reads as
+        "trade places with the window the arrow points at". Works within a screen and
+        across screens: same monitor -> exchange the two zone slots in the tree;
+        different monitors -> each window takes the other's zone on the other monitor.
+        Nothing else in the layout is disturbed, and if there's no window that way the
+        focused one simply stays put."""
+        c = self.client(addr)
+        if not c:
+            return
+        tgt = self._focus_target(c, direction)
+        if not tgt:
+            return                                   # nothing that way -> stay put
+        other = tgt.get("address")
+        if not other or other == addr:
+            return
+        mon_a = self.mon_of_addr(addr)
+        mon_b = self.mon_of_addr(other)
+        if c.get("monitor") == tgt.get("monitor"):
+            # same physical screen: a straight slot swap when we tile both windows
+            if mon_a is not None and mon_a is mon_b:
+                la, lb = mon_a.leaf_of(addr), mon_a.leaf_of(other)
+                if la and lb:
+                    la[1]["win"], lb[1]["win"] = other, addr
+                    self.reprobe_min(addr)
+                    self.reprobe_min(other)
+                    self.apply(mon_a)
+            else:
+                # one of them isn't in our grid (a native/floating window): let
+                # Hyprland swap the two tiled windows the ordinary way
+                hbatch(['hl.dsp.window.swap({direction="%s"})' % direction])
+            return
+        self._swap_across(addr, mon_a, c, other, mon_b, tgt)
+
+    def _swap_across(self, addr, mon_a, ca, other, mon_b, tgt):
+        """Swap two windows living on DIFFERENT monitors: `addr` takes `other`'s place
+        and vice versa. Each window we tile is pulled out of its source zone FIRST so
+        the incoming window drops into a clean, empty slot (no transient subdivide-
+        then-collapse flicker), handed to the destination output BY NAME — the only
+        move that truly reassigns monitor + workspace membership (see cmd_tomon) — and
+        steered into the vacated zone by a one-shot cross_place intent (swap_pending
+        forces the adoption, since an emptied-out floating window passes neither
+        is_tileable nor was_ours). A window whose destination isn't a managed monitor
+        just docks there natively. Focus follows the window the user was driving."""
+        id2name = {m.get("id"): m.get("name") for m in self.monitors_cached()}
+        a_dest = id2name.get(tgt.get("monitor"))     # addr -> other's monitor (by name)
+        b_dest = id2name.get(ca.get("monitor"))      # other -> addr's monitor
+        if not a_dest or not b_dest:
+            return
+        a_dest_mon = self.mons.get(a_dest)           # None when that screen isn't managed
+        b_dest_mon = self.mons.get(b_dest)
+        a_zi = mon_a.leaf_of(addr)[0] if mon_a else None   # addr's current zone
+        b_zi = mon_b.leaf_of(other)[0] if mon_b else None  # other's current zone
+        deadline = time.time() + CROSS_PLACE_TIMEOUT
+        # empty each tiled source slot up front. If that window is headed for an
+        # UNMANAGED screen, on_moved won't reset its stale zone-size float (its tree
+        # slot is already gone), so do that here instead.
+        if mon_a:
+            self.remove(addr, mon_a)
+            if a_dest_mon is None:
+                self.unmanage_float_reset(addr, ca)
+        if mon_b:
+            self.remove(other, mon_b)
+            if b_dest_mon is None:
+                cb = self.client(other)
+                if cb:
+                    self.unmanage_float_reset(other, cb)
+        # land each window in the OTHER's just-vacated zone (managed destinations only)
+        if a_dest_mon is not None:
+            self.cross_place[addr] = (a_dest, [(b_zi, True)], deadline)
+            self.swap_pending.add(addr)
+        if b_dest_mon is not None:
+            self.cross_place[other] = (b_dest, [(a_zi, True)], deadline)
+            self.swap_pending.add(other)
+        self.reprobe_min(addr)
+        self.reprobe_min(other)
+        bx, by = tgt.get("at") or [0, 0]
+        bw, bh = tgt.get("size") or [0, 0]
+        hbatch([
+            'hl.dsp.window.move({monitor="%s", window="address:%s"})' % (a_dest, addr),
+            'hl.dsp.window.move({monitor="%s", window="address:%s"})' % (b_dest, other),
+            'hl.dsp.cursor.move({x=%d,y=%d})' % (bx + bw // 2, by + bh // 2),
+            'hl.dsp.focus({window="address:%s"})' % addr,   # focus follows the driven window
+        ])
 
     def cmd_toggle_float(self, addr):
         mon = self.mon_of_addr(addr)
@@ -2745,7 +2850,7 @@ def cli_fallback(cmd, arg):
         hbatch(['hl.dsp.window.float({action="toggle"})'])
 
 
-COMMANDS = ("daemon", "focus", "move", "tomon", "push", "toggle-float",
+COMMANDS = ("daemon", "focus", "move", "tomon", "push", "swap", "toggle-float",
             "snap-drop", "float-drop", "retile", "rearrange", "dump")
 
 
