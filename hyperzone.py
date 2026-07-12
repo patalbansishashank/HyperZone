@@ -963,7 +963,10 @@ class HyperZone:
         using the normal nice/overflow default (which fills the top first). Only if no
         zone is aligned (window centre off every zone) does it fall back to plain
         ranked order. Always places when `ranked` is non-empty."""
-        order = [zi for zi, al in ranked if al] or [zi for zi, _ in ranked]
+        # zi is None only if a caller passed a bogus intent; drop those so a stray
+        # None can never index mon.trees[None] and abort the placement mid-move.
+        order = ([zi for zi, al in ranked if al and zi is not None]
+                 or [zi for zi, _ in ranked if zi is not None])
         for zi in order:
             if mon.trees[zi] is None:
                 self.was_managed.discard(addr)
@@ -2291,9 +2294,9 @@ class Daemon(HyperZone):
                 # Hyprland swap the two tiled windows the ordinary way
                 hbatch(['hl.dsp.window.swap({direction="%s"})' % direction])
             return
-        self._swap_across(addr, mon_a, c, other, mon_b, tgt)
+        self._swap_across(addr, mon_a, c, other, mon_b, tgt, direction)
 
-    def _swap_across(self, addr, mon_a, ca, other, mon_b, tgt):
+    def _swap_across(self, addr, mon_a, ca, other, mon_b, tgt, direction):
         """Swap two windows living on DIFFERENT monitors: `addr` takes `other`'s place
         and vice versa. Each window we tile is pulled out of its source zone FIRST so
         the incoming window drops into a clean, empty slot (no transient subdivide-
@@ -2310,8 +2313,17 @@ class Daemon(HyperZone):
             return
         a_dest_mon = self.mons.get(a_dest)           # None when that screen isn't managed
         b_dest_mon = self.mons.get(b_dest)
-        a_zi = mon_a.leaf_of(addr)[0] if mon_a else None   # addr's current zone
-        b_zi = mon_b.leaf_of(other)[0] if mon_b else None  # other's current zone
+        # A window's current zone — or None when we DON'T tile it (a floating/detached
+        # window can sit on a managed monitor yet be in no tree). Never let that None
+        # reach cross_place: it would index mon.trees[None] and crash the placement.
+        a_zi = mon_a.leaf_of(addr)[0] if mon_a else None    # addr's current zone
+        b_zi = mon_b.leaf_of(other)[0] if mon_b else None   # other's current zone
+        a_at = ca.get("at") or [0, 0]
+        a_sz = ca.get("size") or [0, 0]
+        a_rect = (a_at[0], a_at[1], a_sz[0], a_sz[1])
+        b_at = tgt.get("at") or [0, 0]
+        b_sz = tgt.get("size") or [0, 0]
+        b_rect = (b_at[0], b_at[1], b_sz[0], b_sz[1])
         deadline = time.time() + CROSS_PLACE_TIMEOUT
         # empty each tiled source slot up front. If that window is headed for an
         # UNMANAGED screen, on_moved won't reset its stale zone-size float (its tree
@@ -2326,17 +2338,22 @@ class Daemon(HyperZone):
                 cb = self.client(other)
                 if cb:
                     self.unmanage_float_reset(other, cb)
-        # land each window in the OTHER's just-vacated zone (managed destinations only)
+        # land each window on its managed destination: in the OTHER's just-vacated zone
+        # when we know it, else in the zone aligned with where it entered from (the same
+        # ranking cmd_tomon uses) — either way a list of REAL zone indices, never None.
         if a_dest_mon is not None:
-            self.cross_place[addr] = (a_dest, [(b_zi, True)], deadline)
+            ranked = [(b_zi, True)] if b_zi is not None \
+                else self.rank_entry_zones(a_dest_mon, a_rect, direction)
+            self.cross_place[addr] = (a_dest, ranked, deadline)
             self.swap_pending.add(addr)
         if b_dest_mon is not None:
-            self.cross_place[other] = (b_dest, [(a_zi, True)], deadline)
+            ranked = [(a_zi, True)] if a_zi is not None \
+                else self.rank_entry_zones(b_dest_mon, b_rect, direction)
+            self.cross_place[other] = (b_dest, ranked, deadline)
             self.swap_pending.add(other)
         self.reprobe_min(addr)
         self.reprobe_min(other)
-        bx, by = tgt.get("at") or [0, 0]
-        bw, bh = tgt.get("size") or [0, 0]
+        bx, by, bw, bh = b_rect
         hbatch([
             'hl.dsp.window.move({monitor="%s", window="address:%s"})' % (a_dest, addr),
             'hl.dsp.window.move({monitor="%s", window="address:%s"})' % (b_dest, other),
