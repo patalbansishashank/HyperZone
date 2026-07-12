@@ -86,6 +86,9 @@ ColumnLayout {
     { title: "Move across everything", desc: "Rearrange in-screen, then spill to the next monitor at the edge",
       items: [{ id: "push-left", label: "Push left" }, { id: "push-right", label: "Push right" },
               { id: "push-up", label: "Push up" }, { id: "push-down", label: "Push down" }] },
+    { title: "Swap window", desc: "Swap the focused window with the one in that direction — works across screens too",
+      items: [{ id: "swap-left", label: "Swap ← left" }, { id: "swap-right", label: "Swap → right" },
+              { id: "swap-up", label: "Swap ↑ up" }, { id: "swap-down", label: "Swap ↓ down" }] },
     { title: "Actions", desc: "Re-tile re-snaps windows into their zones · Rearrange is a hard reset that also reclaims floated windows",
       items: [{ id: "toggle-float", label: "Toggle float" }, { id: "rearrange", label: "Rearrange all" },
               { id: "retile", label: "Re-tile / re-snap" }] },
@@ -99,6 +102,8 @@ ColumnLayout {
     "tomon-up": ["SUPER + SHIFT + up"], "tomon-down": ["SUPER + SHIFT + down"],
     "push-left": ["SUPER + CTRL + SHIFT + left"], "push-right": ["SUPER + CTRL + SHIFT + right"],
     "push-up": ["SUPER + CTRL + SHIFT + up"], "push-down": ["SUPER + CTRL + SHIFT + down"],
+    "swap-left": ["SUPER + ALT + left"], "swap-right": ["SUPER + ALT + right"],
+    "swap-up": ["SUPER + ALT + up"], "swap-down": ["SUPER + ALT + down"],
     "toggle-float": ["SUPER + T"], "rearrange": ["SUPER + SHIFT + T"], "retile": ["SUPER + SHIFT + R"]
   })
   function combosOf(id) { var k = edit.keybinds || {}; return (k[id] || []).slice() }
