@@ -173,7 +173,11 @@ def default_managed(live):
     primary = next((m for m in live if m.get("focused")), live[0])
     cfg = compile_layout(DEFAULT_LAYOUT)
     cfg["enabled"] = True
-    return {mon_identity(primary): cfg}
+    # Key through identify_monitors, not mon_identity: reseed() resolves entries the
+    # same way, and the two disagree exactly when the primary is one of two identical
+    # panels (a shared description identifies neither, so it demotes to the connector
+    # name — a per-monitor lookup can't see that).
+    return {identify_monitors(live)[primary["name"]][0]: cfg}
 
 # ── keybinds (plugin-managed, registered live via `eval hl.bind`) ──
 # Each action maps to the hzctl invocation it runs. The daemon binds/unbinds the
@@ -532,6 +536,11 @@ def standard_modes_for(name):
     return out
 
 
+# Connectors whose stale (EDID-less-era) pin we have already warned about — pin_mode is
+# consulted on every retile/apply, and one warning per boot says everything it can say.
+_stale_pin_warned = set()
+
+
 def is_modeline(mode):
     """A pinned timing: `modeline <pclk_mhz> <h...> <v...> +hsync +vsync`."""
     return str(mode or "").strip().lower().startswith("modeline ")
@@ -589,8 +598,10 @@ def crtc_overcommit(specs):
 
 
 # `-- hz:conn <connector> <driver>:<device> <edid|noedid> <mode>` — the mode runs to end
-# of line, because a pinned timing is a whole modeline, spaces and all.
-CONN_STAMP = re.compile(r"^--\s*hz:conn\s+(\S+)\s+(\S+)\s+(edid|noedid)\s+(.+?)\s*$")
+# of line, because a pinned timing is a whole modeline, spaces and all. The edid token is
+# optional so stamps written by builds that predate it still get audited (they just skip
+# the EDID-transition check, which needs to know the state the block was written under).
+CONN_STAMP = re.compile(r"^--\s*hz:conn\s+(\S+)\s+(\S+)\s+(?:(edid|noedid)\s+)?(.+?)\s*$")
 
 
 def audit_monitors_lua():
@@ -2154,9 +2165,12 @@ class Daemon(HyperZone):
             # definition — the one thing we know is that it isn't the monitor it was
             # written for.
             if has_edid:
-                log("modelines[%s] IGNORED: that connector now carries a display which "
-                    "identifies itself, but the pin was written for an EDID-less one — "
-                    "it is a different monitor. Delete it, or re-pin it." % name)
+                if name not in _stale_pin_warned:   # once per connector, not per retile
+                    _stale_pin_warned.add(name)
+                    log("modelines[%s] IGNORED: that connector now carries a display "
+                        "which identifies itself, but the pin was written for an "
+                        "EDID-less one — it is a different monitor. Delete it, or "
+                        "re-pin it." % name)
             else:
                 pinned = ml[name]
         if pinned:
