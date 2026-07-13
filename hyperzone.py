@@ -29,6 +29,7 @@ Configuration: built-in defaults below, optionally overridden by
 ~/.config/hyperzone/config.json (see load_user_config for the schema).
 Set HYPERZONE_OFF=1 to disable the daemon entirely.
 """
+import glob
 import json
 import os
 import re
@@ -356,6 +357,166 @@ def hyprland_is_migrated():
         return False
 
 
+# ───────────────────────── GPU topology & hard limits ─────────────────────────
+# Per-GPU physical ceilings, keyed by driver -> PCI device id (as spelled in
+# /sys/.../device). Hardware that is NOT in this table is never constrained — we cap
+# only what we actually know, so a future card is never crippled by a guess.
+#
+# Why this exists at all: the availableModes check trusts the MONITOR, and an EDID can
+# lie. A cloned or injected EDID (drm.edid_firmware=) — or a converter passing someone
+# else's through — will cheerfully advertise modes the GPU cannot physically scan out.
+# Pushing 3840x2160@120 at the GF119 below once hung the entire compositor (nouveau
+# gf119_head_state -> "core notifier timeout", ret:-22) instead of erroring, so this is
+# a refuse-outright gate rather than a warning.
+GPU_CAPS = {
+    "nouveau": {
+        # GF119 (Fermi) = GeForce GT 610 [10de:104a]. Two CRTCs, so two active heads
+        # ever; a 165 MHz single-link TMDS on the digital ports; a 400 MHz RAMDAC on
+        # the analog one (which is why VGA can do 1080p but HDMI stops at 1080p60).
+        "0x104a": {"max_crtcs": 2,
+                   "pclk": {"HDMI": 165e6, "DVI": 165e6, "DP": 165e6, "VGA": 400e6}},
+    },
+}
+
+# Active pixels are only ~5/6 of a real frame; the rest is blanking. Calibrated against
+# CEA-861: 1920*1080*60 * 1.20 = 148.6 MHz vs the true 148.5 MHz clock of 1080p60.
+BLANKING_OVERHEAD = 1.20
+
+DRM_CLASS = "/sys/class/drm"
+
+
+def _sysfs(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def connector_kind(name):
+    """The physical port type behind a DRM connector name ('HDMI-A-1' -> 'HDMI')."""
+    n = str(name).upper()
+    for prefix, kind in (("HDMI", "HDMI"), ("DVI", "DVI"), ("VGA", "VGA"),
+                         ("EDP", "eDP"), ("DP", "DP")):
+        if n.startswith(prefix):
+            return kind
+    return "?"
+
+
+def gpu_for_output(name):
+    """Which GPU drives connector `name` -> {card, driver, pci, device}, or None if
+    there is no such connector. DRM connector names are handed out per GPU-enumeration
+    order and are unique system-wide — adding the GT 610 is exactly why the AMD card's
+    HDMI port became HDMI-A-2 — so a `card*-<name>` glob resolves to one card."""
+    for path in sorted(glob.glob(os.path.join(DRM_CLASS, "card*-" + str(name)))):
+        card = os.path.basename(path).split("-", 1)[0]
+        dev = os.path.join(DRM_CLASS, card, "device")
+        return {"card": card,
+                "driver": os.path.basename(os.path.realpath(os.path.join(dev, "driver"))),
+                "pci": os.path.basename(os.path.realpath(dev)),
+                "device": _sysfs(os.path.join(dev, "device")).lower()}
+    return None
+
+
+def gpu_caps(gpu):
+    return GPU_CAPS.get((gpu or {}).get("driver"), {}).get((gpu or {}).get("device"))
+
+
+def gpu_tag(gpu):
+    """Short 'nouveau:0x104a' stamp, recorded beside connector-keyed monitors.lua
+    blocks so a later start can tell whether that port has moved to other hardware."""
+    return "%s:%s" % (gpu["driver"], gpu["device"]) if gpu else "none:none"
+
+
+def mode_pixel_clock(mode):
+    """Estimated pixel clock in Hz for a 'WxH@R' mode string, or None when the mode is
+    not a concrete one ('preferred', 'highres', 'highrr')."""
+    m = re.match(r"\s*(\d+)x(\d+)@([\d.]+)", str(mode or ""))
+    if not m:
+        return None
+    return int(m.group(1)) * int(m.group(2)) * float(m.group(3)) * BLANKING_OVERHEAD
+
+
+def mode_beyond_gpu(name, mode):
+    """Why `mode` exceeds the physical limits of the GPU driving connector `name`, or
+    None if it fits — or if the hardware isn't in GPU_CAPS, in which case we say
+    nothing rather than invent a limit."""
+    gpu = gpu_for_output(name)
+    caps = gpu_caps(gpu)
+    if not caps:
+        return None
+    kind = connector_kind(name)
+    limit = (caps.get("pclk") or {}).get(kind)
+    pclk = mode_pixel_clock(mode)
+    if not limit or pclk is None or pclk <= limit:
+        return None
+    return ("%s is driven by %s %s (%s): its %s port tops out around %d MHz, but %s "
+            "needs ~%d MHz" % (name, gpu["driver"], gpu["device"], gpu["pci"], kind,
+                               limit / 1e6, mode, pclk / 1e6))
+
+
+def crtc_overcommit(specs):
+    """Why `specs` would light more heads on one card than it has CRTCs, or None. The
+    GF119 has two: a third enabled output simply cannot be scanned out."""
+    per_card = {}
+    for s in specs:
+        if s.get("disabled"):
+            continue
+        gpu = gpu_for_output(s.get("name"))
+        if gpu:
+            per_card.setdefault(gpu["card"], (gpu, []))[1].append(s["name"])
+    for card, (gpu, names) in sorted(per_card.items()):
+        limit = (gpu_caps(gpu) or {}).get("max_crtcs")
+        if limit and len(names) > limit:
+            return ("%s (%s %s) has only %d CRTCs, but %d outputs would be enabled: %s"
+                    % (card, gpu["driver"], gpu["device"], limit, len(names),
+                       ", ".join(sorted(names))))
+    return None
+
+
+CONN_STAMP = re.compile(r"^--\s*hz:conn\s+(\S+)\s+(\S+)\s+(\S+)")
+
+
+def audit_monitors_lua():
+    """Check every CONNECTOR-KEYED block in monitors.lua against the hardware that is
+    actually present, and return human-readable warnings (empty = all clear).
+
+    Only these blocks can betray us. A `desc:` rule can never match anything but its
+    own panel, whereas a bare connector name matches whatever port carries that name
+    today — which is how a persisted 4K@120 ended up aimed at a Fermi card. We stamp
+    each one with the GPU it was written for; if that no longer holds, say so.
+
+    This runs at daemon start, i.e. AFTER Hyprland has already applied the file. It
+    cannot prevent a bad boot — only explain one, and point at the fix."""
+    warnings = []
+    try:
+        with open(MONITORS_LUA) as f:
+            text = f.read()
+    except OSError:
+        return warnings
+    for line in text.split("\n"):
+        m = CONN_STAMP.match(line.strip())
+        if not m:
+            continue
+        name, tag, mode = m.group(1), m.group(2), m.group(3)
+        gpu = gpu_for_output(name)
+        if gpu is None:
+            warnings.append("monitors.lua still configures %s, but no connector by that "
+                            "name exists any more — that block is dead. Re-apply your "
+                            "display layout to drop it." % name)
+        elif gpu_tag(gpu) != tag:
+            warnings.append("monitors.lua sets %s to %s, but %s was written for %s and "
+                            "is now driven by %s — that connector name has moved to "
+                            "different hardware. Re-apply your display layout."
+                            % (name, mode, name, tag, gpu_tag(gpu)))
+        else:
+            why = mode_beyond_gpu(name, mode)
+            if why:
+                warnings.append("monitors.lua asks for a mode the GPU cannot drive: %s. "
+                                "Re-apply your display layout." % why)
+    return warnings
+
+
 def _output_selector(spec):
     """The `output=` value for an hl.monitor block. Prefer Hyprland's stable
     `desc:<make model serial>` selector over the connector name (HDMI-A-1, …):
@@ -363,7 +524,12 @@ def _output_selector(spec):
     DIFFERENT physical port whenever the GPU set changes (a card added/removed, a
     driver blacklisted). A `desc:` rule follows the physical panel wherever its
     connector lands, so a mode written for a 4K TV can never be pushed at a GPU
-    that can't drive it. Falls back to the connector name when no desc is known."""
+    that can't drive it.
+
+    Falls back to the connector name when the spec carries no desc — a panel that
+    publishes no EDID (see identify_monitors), or one whose description is shared with
+    another live monitor and so identifies neither. Those blocks are inherently
+    unstable, so they are stamped and re-audited: see generate_monitors_lua."""
     desc = str(spec.get("desc") or "").strip().replace('"', "")
     if desc:
         return "desc:" + desc
@@ -376,12 +542,36 @@ def generate_monitors_lua(specs):
     `mode` may be an availableModes string ('1920x1080@60.00Hz') — the 'Hz' suffix
     is stripped to the 'WxH@R' form the Hyprland config parser expects. Monitors
     are keyed by desc: (see _output_selector) so the config survives connector-name
-    churn across GPU-topology changes."""
+    churn across GPU-topology changes.
+
+    Two safety rules apply here, because this file is read at BOOT — when nothing of
+    ours is running to second-guess it:
+      • a mode the owning GPU physically cannot drive is never written; it degrades to
+        `preferred`. The line that hung this machine was a persisted 4K@120 that had
+        drifted onto a Fermi card.
+      • a block that had to fall back to a connector name gets an `-- hz:conn` stamp
+        naming the GPU it was written for, so audit_monitors_lua() can catch it at the
+        next start if that name has since moved to other hardware."""
     out = ["-- generated by hyperzone — do not edit by hand",
            "-- (edit displays via Noctalia → HyperZone plugin settings)", ""]
     for m in specs:
+        selector = _output_selector(m)
+        if not m.get("disabled"):
+            why = mode_beyond_gpu(m["name"], m.get("mode"))
+            if why:
+                log("monitors.lua: refusing to write an undrivable mode —", why,
+                    "— using `preferred` instead")
+                m = dict(m, mode="preferred")
+        if not selector.startswith("desc:"):
+            out.append("-- hz:conn %s %s %s" % (m["name"], gpu_tag(gpu_for_output(m["name"])),
+                                                "disable" if m.get("disabled")
+                                                else m.get("mode", "preferred")))
+            out.append("-- ^ keyed by CONNECTOR NAME (this panel publishes no EDID, or shares"
+                       " its description with another) — such names move between physical"
+                       " ports when the GPU set changes, so this block is re-checked against"
+                       " the stamp above on every start")
         out.append("hl.monitor({")
-        out.append('    output = "%s",' % _output_selector(m))
+        out.append('    output = "%s",' % selector)
         if m.get("disabled"):
             out.append('    mode = "disable",')
             out += ["})", ""]
@@ -715,20 +905,53 @@ def remove_win(node, addr):
 
 
 # ───────────────────────── monitor state ─────────────────────────
-def mon_identity(info):
-    """A monitor's STABLE identity, independent of its DRM connector name
-    (HDMI-A-1, …). Connector names are assigned per GPU-enumeration order, so they
-    migrate to a different physical port whenever the GPU set changes — which is
-    exactly what made a zone layout jump to the wrong screen. We key on Hyprland's
-    `description` (EDID make + model + serial) — the SAME identity the generated
-    monitors.lua uses via desc:. Falls back to make/model/serial, then the connector
-    name, when no description is exposed."""
+def _mon_desc(info):
+    """What the monitor says it is, from its EDID (Hyprland's `description` = make +
+    model + serial), or "" when it publishes nothing."""
     d = str(info.get("description") or "").strip()
     if d:
         return d
-    mms = " ".join(str(info.get(k) or "").strip()
-                   for k in ("make", "model", "serial")).strip()
-    return mms or info.get("name")
+    return " ".join(str(info.get(k) or "").strip()
+                    for k in ("make", "model", "serial")).strip()
+
+
+def identify_monitors(live):
+    """{name: (key, kind)} — a stable key for every live monitor, plus the scheme that
+    produced it. Pass the WHOLE live list: duplicates can only be spotted in company.
+
+      "desc" — the EDID description. Stable: it follows the physical panel wherever its
+               connector lands, which is what stops a mode (or a zone layout) from being
+               pushed at whatever screen inherited an old connector name.
+
+      "conn" — the DRM connector name, used only when a description cannot identify the
+               panel:
+                 • it publishes NO EDID — an active VGA->HDMI converter typically does
+                   not pass one back, so the connector's EDID is literally 0 bytes and
+                   make/model/serial all arrive empty; or
+                 • two live panels report the SAME description, which identifies neither
+                   — and a `desc:` rule in monitors.lua would match BOTH of them. Not
+                   hypothetical: a monitor with an empty serial (e.g. "SAC 27QHDMIQNN53P")
+                   collides with itself the moment a second identical one is plugged in.
+               Connector names are assigned per GPU-enumeration order, so a conn key is
+               NOT stable across a GPU change. Everything keyed this way is treated as
+               suspect — stamped into monitors.lua, re-audited at start, and promoted to
+               a desc key as soon as the panel starts identifying itself."""
+    seen = {}
+    for m in live:
+        d = _mon_desc(m)
+        if d:
+            seen[d] = seen.get(d, 0) + 1
+    out = {}
+    for m in live:
+        d = _mon_desc(m)
+        out[m["name"]] = (d, "desc") if d and seen[d] == 1 else (m["name"], "conn")
+    return out
+
+
+def mon_identity(info):
+    """One monitor's stable key in isolation. Callers holding the full live list should
+    prefer identify_monitors(), which can also see duplicate descriptions."""
+    return _mon_desc(info) or info.get("name")
 
 
 class Monitor:
@@ -891,30 +1114,32 @@ class HyperZone:
     def reseed(self):
         self.invalidate_monitors()
         live = self.monitors_cached()
-        # Resolve each managed config entry to a live monitor by STABLE IDENTITY
-        # (EDID make/model/serial) first, falling back to the DRM connector name for
-        # legacy name-keyed configs. Identity keying means a zone layout follows its
-        # physical panel across connector-name churn (a GPU added/removed renames
-        # ports) instead of hijacking whatever screen now answers to the old name.
-        by_ident, by_name = {}, {}
+        # Resolve each managed config entry to a live monitor by STABLE IDENTITY (its
+        # EDID description) first, falling back to the DRM connector name — for panels
+        # that publish no EDID, and for legacy name-keyed configs. Identity keying means
+        # a zone layout follows its physical panel across connector-name churn (a GPU
+        # added or removed renames ports) instead of hijacking whatever screen now
+        # answers to the old name.
+        ids = identify_monitors(live)
+        by_key, by_name = {}, {}
         for m in live:
-            by_ident.setdefault(mon_identity(m), m)
+            by_key.setdefault(ids[m["name"]][0], m)
             by_name.setdefault(m["name"], m)
         old = {mon.ident: mon for mon in self.mons.values()}   # preserve by identity
         self.mons = {}
         for key, cfg in MANAGED.items():
             if not cfg.get("enabled", True):        # skip toggled-off monitors
                 continue
-            info = by_ident.get(key) or by_name.get(key)
+            info = by_key.get(key) or by_name.get(key)
             if info is None:                        # that monitor isn't connected now
                 continue
-            ident = mon_identity(info)
+            ident = ids[info["name"]][0]
             mon = Monitor(info["name"], cfg, info, ident)
             prev = old.get(ident)
             if prev is not None and len(prev.trees) == len(mon.trees):
                 mon.trees = prev.trees              # keep layout across reseed / rename
             self.mons[info["name"]] = mon
-        dlog("reseed managed:", {n: m.ident for n, m in self.mons.items()})
+        dlog("reseed managed:", {n: ids[n] for n in self.mons})
 
     def mon_of_addr(self, addr):
         for mon in self.mons.values():
@@ -1463,14 +1688,16 @@ class Daemon(HyperZone):
         them on. Global keys fall back to the live defaults."""
         cfg = {k: v for k, v in USER_CONFIG.items() if k != "managed"}
         user_managed = USER_CONFIG.get("managed", {})
+        live = self.live_monitors()
+        ids = identify_monitors(live)
         managed = {}
-        for m in self.live_monitors():
+        for m in live:
             name = m.get("name")
             if not name:
                 continue
             # config.json is keyed by stable identity; the name-keyed UI wants this
             # monitor's entry looked up by identity (with a legacy name key fallback).
-            saved = user_managed.get(mon_identity(m), user_managed.get(name))
+            saved = user_managed.get(ids[name][0], user_managed.get(name))
             if saved is not None:
                 entry = dict(saved)
                 entry.setdefault("enabled", True)
@@ -1513,6 +1740,40 @@ class Daemon(HyperZone):
             json.dump(cfg, f, indent=2)
         os.replace(tmp, CONFIG_PATH)   # atomic: a crash can't leave a half file
 
+    def promote_identities(self):
+        """Re-key any managed monitor that was stored under a connector name and can
+        now identify itself properly.
+
+        A conn key is what we fall back to for a panel that told us nothing. The moment
+        it DOES — an EDID gets injected via drm.edid_firmware=, a flaky converter starts
+        passing one through, a second identical monitor is unplugged and its twin's
+        description becomes unique again — its stable identity changes. Without this,
+        that monitor would look brand-new to HyperZone and silently lose its zones."""
+        global USER_CONFIG
+        managed = USER_CONFIG.get("managed")
+        if not isinstance(managed, dict) or not managed:
+            return
+        ids = identify_monitors(self.live_monitors())
+        moves = {name: key for name, (key, kind) in ids.items()
+                 if kind == "desc" and name in managed and key not in managed}
+        if not moves:
+            return
+        cfg = dict(USER_CONFIG)
+        cfg["managed"] = dict(managed)
+        for name, key in moves.items():
+            cfg["managed"][key] = cfg["managed"].pop(name)
+        try:
+            apply_config(cfg)          # validates first -> globals untouched on error
+            self._write_config(cfg)
+        except Exception as e:         # a promotion is never worth failing a start over
+            log("identity promotion failed:", e)
+            return
+        USER_CONFIG = cfg
+        for name, key in moves.items():
+            log("identity: %s now identifies itself as %r — re-keyed its config off the "
+                "connector name" % (name, key))
+        self.reseed()
+
     # -- RPC handlers (return a JSON-able result or raise) --
     def rpc_get_state(self, params):
         return self.state_snapshot()
@@ -1535,12 +1796,14 @@ class Daemon(HyperZone):
         stable monitor identity, so it survives connector-name churn. Resolves each
         key against the CURRENT live monitors (correct because the UI is editing the
         current topology): a connector name -> that monitor's identity; a key that is
-        already an identity, or names a disconnected monitor, is kept as-is."""
-        name2ident = {m["name"]: mon_identity(m) for m in self.live_monitors()}
-        idents = set(name2ident.values())
+        already an identity, or names a disconnected monitor, is kept as-is. A monitor
+        with no usable identity keys by connector name, so for it the two coincide."""
+        name2key = {name: key for name, (key, _)
+                    in identify_monitors(self.live_monitors()).items()}
+        keys = set(name2key.values())
         out = {}
         for key, mc in managed.items():
-            out[key if key in idents else name2ident.get(key, key)] = mc
+            out[key if key in keys else name2key.get(key, key)] = mc
         return out
 
     def rpc_set_config(self, params):
@@ -1687,14 +1950,20 @@ class Daemon(HyperZone):
             subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=5)
 
     def _live_specs(self):
-        """Current live monitors as generator specs (basis for revert / first monitors.lua)."""
+        """Current live monitors as generator specs (basis for revert / first monitors.lua).
+        `desc` is set only when the description is a USABLE identity — unique and
+        non-empty. That is what makes _output_selector emit a stable `desc:` rule; a
+        monitor without one falls back to its connector name, deliberately."""
+        live = self.live_monitors()
+        ids = identify_monitors(live)
         specs = []
-        for m in self.live_monitors():
+        for m in live:
+            key, kind = ids[m["name"]]
+            desc = key if kind == "desc" else None
             if m.get("disabled"):
-                specs.append({"name": m["name"], "desc": m.get("description"),
-                              "disabled": True})
+                specs.append({"name": m["name"], "desc": desc, "disabled": True})
             else:
-                specs.append({"name": m["name"], "desc": m.get("description"),
+                specs.append({"name": m["name"], "desc": desc,
                               "mode": "%dx%d@%.2f" % (m["width"], m["height"],
                                                       float(m.get("refreshRate", 60))),
                               "x": m.get("x", 0), "y": m.get("y", 0),
@@ -1723,12 +1992,14 @@ class Daemon(HyperZone):
         if not isinstance(mons, list) or not mons:
             raise ValueError("monitors must be a non-empty list")
         live = {m["name"]: m for m in self.live_monitors()}
+        ids = identify_monitors(list(live.values()))
         specs = []
         for m in mons:
             name = m.get("name")
             if name not in live:
                 raise ValueError("unknown monitor: %r" % name)
-            desc = live[name].get("description")
+            key, kind = ids[name]
+            desc = key if kind == "desc" else None    # None -> keyed by connector name
             if m.get("disabled"):
                 specs.append({"name": name, "desc": desc, "disabled": True})
                 continue
@@ -1736,6 +2007,12 @@ class Daemon(HyperZone):
             modes = [str(x) for x in live[name].get("availableModes", [])]
             if mode not in modes and mode not in ("preferred", "highres", "highrr"):
                 raise ValueError("monitor %s: mode %r not available" % (name, mode))
+            # availableModes trusts the MONITOR (it is EDID-derived, and an EDID can be
+            # cloned, injected or simply wrong). This trusts the GPU instead: refuse a
+            # mode the card cannot physically scan out, whatever the panel claims.
+            beyond = mode_beyond_gpu(name, mode)
+            if beyond:
+                raise ValueError(beyond)
             if float(m.get("scale", 1)) <= 0:
                 raise ValueError("monitor %s: scale must be > 0" % name)
             if int(m.get("transform", 0)) not in range(8):
@@ -1743,6 +2020,9 @@ class Daemon(HyperZone):
             specs.append({"name": name, "desc": desc, "mode": mode,
                           "x": int(m.get("x", 0)), "y": int(m.get("y", 0)),
                           "scale": m.get("scale", 1), "transform": int(m.get("transform", 0))})
+        over = crtc_overcommit(specs)
+        if over:
+            raise ValueError(over)
         # snapshot the exact current live state so revert is exact
         self.layout_prev_specs = self._live_specs()
         migrated = hyprland_is_migrated()
@@ -1876,6 +2156,7 @@ class Daemon(HyperZone):
                 # coalesce: a burst of fullscreen flips -> one reconcile per tick
                 self.reconcile_needed = True
             elif name.startswith("monitoradded") or name.startswith("monitorremoved"):
+                self.promote_identities()   # a re-plugged panel may now publish an EDID
                 self.reseed()        # monitor hot-plug: drop/keep managed monitors
                 self.emit("monitors_changed", {"monitors": self.live_monitors()})
             elif name.startswith("configreloaded"):
@@ -2840,6 +3121,13 @@ class Daemon(HyperZone):
         self._bind_control_socket()
         refresh_gaps()              # borrow gaps/border from the live Hyprland config
         refresh_borders()           # config border colours (for repainting managed)
+        self.promote_identities()   # adopt stable keys for panels that gained an EDID
+        # monitors.lua has ALREADY been applied by Hyprland by the time we get here, so
+        # this can only explain a bad boot, never prevent one. Still the fastest way to
+        # find out that a connector-keyed block is now aimed at the wrong hardware.
+        lua_warnings = audit_monitors_lua()
+        for w in lua_warnings:
+            log("WARNING:", w)
         self.retile(restore=True)   # restore prior layout if the daemon restarted
         for a in list(self.painted):  # re-assert amber on windows we had painted
             self.paint(a, True)
@@ -2850,6 +3138,8 @@ class Daemon(HyperZone):
             os.set_blocking(0, False)
             self.sel.register(0, selectors.EVENT_READ, ("rpc", b""))
             self.emit("ready", self.state_snapshot())
+            for w in lua_warnings:     # surface them in the UI, not just the log
+                self.emit("error", {"message": w})
             # take ownership of the HyperZone keybinds: comment the hand-written
             # ones out of hyprland.lua (once) and register the configured set live.
             self.migrate_keybinds()
