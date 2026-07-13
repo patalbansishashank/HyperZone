@@ -226,7 +226,7 @@ ColumnLayout {
     dispEdit = ms.map(function (m) {
       return { name: m.name, mode: currentModeOf(m), x: m.x || 0, y: m.y || 0,
                scale: m.scale || 1, transform: m.transform || 0, disabled: !!m.disabled,
-               modes: (m.availableModes || []).slice() }
+               noEdid: !!m.noEdid, modes: (m.availableModes || []).slice() }
     })
     if (dispSel >= dispEdit.length) dispSel = 0
     dispBaseline = JSON.stringify(dispSpecs())   // fresh load == not dirty
@@ -241,6 +241,21 @@ ColumnLayout {
     return modes.length ? modes[0] : (pfx + (m.refreshRate || 60).toFixed(2) + "Hz")
   }
   function selDisp() { return dispEdit[dispSel] || null }
+  // A hand-written timing for one display, keyed by connector name. Only ever offered
+  // for a display that publishes no EDID — the daemon ignores such a pin the moment
+  // that port carries a display which CAN identify itself, since a connector name does
+  // not follow a panel across a cable swap.
+  function modelineOf(name) {
+    return (edit.modelines && edit.modelines[name]) ? String(edit.modelines[name]) : ""
+  }
+  function setModeline(name, text) {
+    var ml = edit.modelines ? JSON.parse(JSON.stringify(edit.modelines)) : ({})
+    text = String(text || "").trim()
+    if (text) ml[name] = text
+    else delete ml[name]
+    edit.modelines = ml
+    rev++
+  }
   // Reassign the array (not just mutate in place) so DisplayCanvas's `monitors`
   // binding actually changes reference and resyncs its working copy — otherwise
   // scale/rotation/mode edits never show up in the preview.
@@ -350,6 +365,27 @@ ColumnLayout {
               model: [{ key: "1", name: "1 · off" }, { key: "2", name: "2 zones" }, { key: "4", name: "4 zones" }]
               currentKey: (root.rev, root.selDisp() ? String(root.zoneCountOf(root.selDisp().name)) : "1")
               onSelected: (key) => { if (root.selDisp()) root.setZoneCount(root.selDisp().name, parseInt(key)) }
+            }
+          }
+
+          // Only for a display that publishes no EDID. Every other monitor gets its mode
+          // list from the panel itself, and a hand-written timing there is meaningless.
+          ColumnLayout {
+            Layout.fillWidth: true; spacing: Style.marginXS
+            visible: (root.dispRev, root.selDisp() ? !!root.selDisp().noEdid : false)
+            NText {
+              Layout.fillWidth: true; wrapMode: Text.WordWrap
+              pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
+              text: "This display publishes no EDID, so it cannot tell us what it supports — " +
+                    "the resolutions above are standard VESA timings, not the panel's own. " +
+                    "If none of them give a correct picture, enter a custom timing here."
+            }
+            NTextInput {
+              Layout.fillWidth: true
+              label: "Custom timing (advanced) — overrides the resolution above"
+              placeholderText: "modeline 148.50 1920 2008 2052 2200 1080 1084 1089 1125 +hsync +vsync"
+              text: (root.rev, root.dispRev, root.selDisp() ? root.modelineOf(root.selDisp().name) : "")
+              onEditingFinished: if (root.selDisp()) root.setModeline(root.selDisp().name, text)
             }
           }
         }

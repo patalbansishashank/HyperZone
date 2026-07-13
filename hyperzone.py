@@ -588,9 +588,9 @@ def crtc_overcommit(specs):
     return None
 
 
-# `-- hz:conn <connector> <driver>:<device> <mode>` — mode runs to end of line, because
-# a pinned timing is a whole modeline, spaces and all.
-CONN_STAMP = re.compile(r"^--\s*hz:conn\s+(\S+)\s+(\S+)\s+(.+?)\s*$")
+# `-- hz:conn <connector> <driver>:<device> <edid|noedid> <mode>` — the mode runs to end
+# of line, because a pinned timing is a whole modeline, spaces and all.
+CONN_STAMP = re.compile(r"^--\s*hz:conn\s+(\S+)\s+(\S+)\s+(edid|noedid)\s+(.+?)\s*$")
 
 
 def audit_monitors_lua():
@@ -614,8 +614,9 @@ def audit_monitors_lua():
         m = CONN_STAMP.match(line.strip())
         if not m:
             continue
-        name, tag, mode = m.group(1), m.group(2), m.group(3)
+        name, tag, edid_then, mode = m.group(1), m.group(2), m.group(3), m.group(4)
         gpu = gpu_for_output(name)
+        edid_now = "edid" if connector_has_edid(name) else "noedid"
         if gpu is None:
             warnings.append("monitors.lua still configures %s, but no connector by that "
                             "name exists any more — that block is dead. Re-apply your "
@@ -625,6 +626,17 @@ def audit_monitors_lua():
                             "is now driven by %s — that connector name has moved to "
                             "different hardware. Re-apply your display layout."
                             % (name, mode, name, tag, gpu_tag(gpu)))
+        elif edid_then == "noedid" and edid_now == "edid":
+            # The cable-swap case. We could never identify the old panel (that is what
+            # "noedid" means), so we cannot tell whether this is the same display that
+            # has started talking, or a completely different monitor plugged into the
+            # same port. Either way the timing we pinned was written for a display we
+            # can no longer vouch for.
+            warnings.append("monitors.lua pins %s to %s, but that was written when the "
+                            "display there published NO EDID — and now one does. Either "
+                            "the monitor was swapped or the cable moved. The pinned "
+                            "timing is for a display we can no longer identify: check "
+                            "%s in the display settings and re-apply." % (name, mode, name))
         else:
             why = mode_beyond_gpu(name, mode)
             if why:
@@ -679,13 +691,15 @@ def generate_monitors_lua(specs):
                     "— using `preferred` instead")
                 m = dict(m, mode="preferred")
         if not selector.startswith("desc:"):
-            out.append("-- hz:conn %s %s %s" % (m["name"], gpu_tag(gpu_for_output(m["name"])),
-                                                "disable" if m.get("disabled")
-                                                else m.get("mode", "preferred")))
+            out.append("-- hz:conn %s %s %s %s"
+                       % (m["name"], gpu_tag(gpu_for_output(m["name"])),
+                          "noedid" if not connector_has_edid(m["name"]) else "edid",
+                          "disable" if m.get("disabled") else m.get("mode", "preferred")))
             out.append("-- ^ keyed by CONNECTOR NAME (this panel publishes no EDID, or shares"
-                       " its description with another) — such names move between physical"
-                       " ports when the GPU set changes, so this block is re-checked against"
-                       " the stamp above on every start")
+                       " its description with another). Connector names do NOT follow panels"
+                       " — they move when the GPU set changes, and they stay put when you"
+                       " swap a cable — so this block is re-checked against the stamp above"
+                       " on every start.")
         out.append("hl.monitor({")
         out.append('    output = "%s",' % selector)
         if m.get("disabled"):
@@ -1804,7 +1818,12 @@ class Daemon(HyperZone):
         capable the panel behind it actually is. See standard_modes_for."""
         mons = hjson("monitors", "all") or hjson("monitors") or []
         for m in mons:
-            offered = standard_modes_for(m.get("name"))
+            name = m.get("name")
+            # `noEdid` tells the UI to show the custom-timing field: it is the only case
+            # where the mode list is ours rather than the display's, and the only case
+            # where a hand-written timing is ever the right answer.
+            m["noEdid"] = not connector_has_edid(name)
+            offered = standard_modes_for(name)
             if offered:
                 have = [x for x in (m.get("availableModes") or []) if x not in offered]
                 m["availableModes"] = offered + have
@@ -1869,39 +1888,26 @@ class Daemon(HyperZone):
             json.dump(cfg, f, indent=2)
         os.replace(tmp, CONFIG_PATH)   # atomic: a crash can't leave a half file
 
-    def promote_identities(self):
-        """Re-key any managed monitor that was stored under a connector name and can
-        now identify itself properly.
+    def warn_stale_conn_keys(self):
+        """Warn about a config entry keyed by connector name whose port now carries a
+        display that CAN identify itself.
 
-        A conn key is what we fall back to for a panel that told us nothing. The moment
-        it DOES — an EDID gets injected via drm.edid_firmware=, a flaky converter starts
-        passing one through, a second identical monitor is unplugged and its twin's
-        description becomes unique again — its stable identity changes. Without this,
-        that monitor would look brand-new to HyperZone and silently lose its zones."""
-        global USER_CONFIG
+        We deliberately do NOT re-key it. A connector-keyed entry exists precisely
+        because that panel could not be identified — so when a description appears there,
+        the one thing we cannot know is whether it is the same monitor that finally
+        started talking, or a completely different one on a swapped cable. Adopting the
+        entry would silently hand that monitor's zones (and its pinned timing) to a
+        stranger. Saying so and doing nothing is the honest move: the old entry simply
+        stops matching, the display shows up unmanaged, and the user re-enables it."""
         managed = USER_CONFIG.get("managed")
         if not isinstance(managed, dict) or not managed:
             return
-        ids = identify_monitors(self.live_monitors())
-        moves = {name: key for name, (key, kind) in ids.items()
-                 if kind == "desc" and name in managed and key not in managed}
-        if not moves:
-            return
-        cfg = dict(USER_CONFIG)
-        cfg["managed"] = dict(managed)
-        for name, key in moves.items():
-            cfg["managed"][key] = cfg["managed"].pop(name)
-        try:
-            apply_config(cfg)          # validates first -> globals untouched on error
-            self._write_config(cfg)
-        except Exception as e:         # a promotion is never worth failing a start over
-            log("identity promotion failed:", e)
-            return
-        USER_CONFIG = cfg
-        for name, key in moves.items():
-            log("identity: %s now identifies itself as %r — re-keyed its config off the "
-                "connector name" % (name, key))
-        self.reseed()
+        for name, (key, kind) in identify_monitors(self.live_monitors()).items():
+            if kind == "desc" and name in managed and key not in managed:
+                log("WARNING: config has an entry keyed %r, but that connector now "
+                    "carries a display which identifies itself as %r. It may be a "
+                    "different monitor (a swapped cable). Leaving the old entry alone — "
+                    "set this display up again in HyperZone settings." % (name, key))
 
     # -- RPC handlers (return a JSON-able result or raise) --
     def rpc_get_state(self, params):
@@ -2104,10 +2110,24 @@ class Daemon(HyperZone):
         display edit would round-trip a synthesized timing straight back into
         monitors.lua and quietly undo the fix."""
         ml = USER_CONFIG.get("modelines") or {}
-        pinned = ml.get(key) or ml.get(name)
+        has_edid = connector_has_edid(name)
+        pinned = ml.get(key) if key != name else None    # keyed by a real identity
+        if pinned is None and name in ml:
+            # Keyed by CONNECTOR NAME — only trustworthy while that port still has no
+            # EDID. Connector names don't follow panels: swap the cables and this pin
+            # would aim an EDID-less display's timing at whatever is now plugged in. If
+            # the port now holds a display that CAN identify itself, the pin is stale by
+            # definition — the one thing we know is that it isn't the monitor it was
+            # written for.
+            if has_edid:
+                log("modelines[%s] IGNORED: that connector now carries a display which "
+                    "identifies itself, but the pin was written for an EDID-less one — "
+                    "it is a different monitor. Delete it, or re-pin it." % name)
+            else:
+                pinned = ml[name]
         if pinned:
             return pinned
-        if is_modeline(mode) or connector_has_edid(name):
+        if is_modeline(mode) or has_edid:
             return mode
         m = re.match(r"\s*(\d+)x(\d+)@([\d.]+)", str(mode or ""))
         if not m:
@@ -2333,7 +2353,7 @@ class Daemon(HyperZone):
                 # coalesce: a burst of fullscreen flips -> one reconcile per tick
                 self.reconcile_needed = True
             elif name.startswith("monitoradded") or name.startswith("monitorremoved"):
-                self.promote_identities()   # a re-plugged panel may now publish an EDID
+                self.warn_stale_conn_keys()  # a re-plugged panel may now publish an EDID
                 self.reseed()        # monitor hot-plug: drop/keep managed monitors
                 self.emit("monitors_changed", {"monitors": self.live_monitors()})
             elif name.startswith("configreloaded"):
@@ -3298,7 +3318,7 @@ class Daemon(HyperZone):
         self._bind_control_socket()
         refresh_gaps()              # borrow gaps/border from the live Hyprland config
         refresh_borders()           # config border colours (for repainting managed)
-        self.promote_identities()   # adopt stable keys for panels that gained an EDID
+        self.warn_stale_conn_keys()  # a connector-keyed entry may now point at a stranger
         # monitors.lua has ALREADY been applied by Hyprland by the time we get here, so
         # this can only explain a bad boot, never prevent one. Still the fastest way to
         # find out that a connector-keyed block is now aimed at the wrong hardware.
