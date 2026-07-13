@@ -156,10 +156,24 @@ def compile_layout(layout):
     return {"cells": cells, "fill": fill, "nice": nice}
 
 
-# Built-in default when no config.json exists: manage HDMI-A-1 with the standard
-# four-zone layout. Same compile path as user configs, so there is exactly one
-# definition of the default zone shapes (DEFAULT_LAYOUT above).
-MANAGED = {"HDMI-A-1": compile_layout(DEFAULT_LAYOUT)}
+def default_managed(live):
+    """The zero-config default: manage ONE monitor — whichever Hyprland has focused
+    (its primary), else the first connected — with the standard four-zone layout,
+    keyed by that monitor's stable identity.
+
+    This used to be hardcoded to the connector name "HDMI-A-1", which means nothing on
+    anyone else's machine: a fresh install would find no such output, manage nothing,
+    and look broken. Resolving it against the live monitor set instead makes the first
+    run work anywhere. It applies ONLY while config.json has no `managed` section — the
+    moment the user touches the Zones tab their choice is persisted and this stops
+    being consulted. Same compile path as a user config, so DEFAULT_LAYOUT stays the
+    single definition of the default zone shapes."""
+    if not live:
+        return {}
+    primary = next((m for m in live if m.get("focused")), live[0])
+    cfg = compile_layout(DEFAULT_LAYOUT)
+    cfg["enabled"] = True
+    return {mon_identity(primary): cfg}
 
 # ── keybinds (plugin-managed, registered live via `eval hl.bind`) ──
 # Each action maps to the hzctl invocation it runs. The daemon binds/unbinds the
@@ -280,6 +294,16 @@ def validate_config(cfg):
     for k in ("border_float", "border_float_inactive"):
         if k in cfg and not isinstance(cfg[k], str):
             raise ValueError("%s must be a string" % k)
+    if "modelines" in cfg:
+        ml = cfg["modelines"]
+        if not isinstance(ml, dict):
+            raise ValueError("modelines must be an object")
+        for key, line in ml.items():
+            if not isinstance(line, str) or not is_modeline(line):
+                raise ValueError("modelines.%s must be a string starting with "
+                                 "'modeline ' (got %r)" % (key, line))
+            if mode_pixel_clock(line) is None:
+                raise ValueError("modelines.%s: cannot read a pixel clock from it" % key)
     if "keybinds" in cfg:
         kb = cfg["keybinds"]
         if not isinstance(kb, dict):
@@ -428,10 +452,100 @@ def gpu_tag(gpu):
     return "%s:%s" % (gpu["driver"], gpu["device"]) if gpu else "none:none"
 
 
+# ──────────────────── standard timings for EDID-less outputs ────────────────────
+# Published VESA DMT / CEA-861 timings. NOT this machine's numbers — this is the same
+# table every monitor and scaler on earth is built around.
+#
+# Why we need it at all: a display that publishes no EDID cannot tell the kernel what it
+# supports, so the kernel INVENTS a timing (GTF, or CVT) for any mode you ask for. Those
+# are mathematically-derived timings that no real display ever ships — e.g. GTF makes
+# 1920x1080@60 a 2576x1118 frame at 172.78 MHz, where the standard is 2200x1125 at
+# 148.50 MHz. Sinks that sample a signal rather than read a mode number (an analog
+# VGA->HDMI converter, a KVM, a capture card, a cheap scaler) match the incoming timing
+# against a table of standard modes. Handed a synthesized one they mis-lock — the picture
+# comes out offset, letterboxed, or squashed to the wrong aspect. Handing them a REAL
+# standard timing is the fix, and it is right for every such device, not just one.
+#
+# (w, h, refresh): (pclk_khz, hss, hse, htot, vss, vse, vtot, hsync_pol, vsync_pol)
+STD_TIMINGS = {
+    (640, 480, 60):    (25175, 656, 752, 800, 490, 492, 525, "-", "-"),
+    (800, 600, 60):    (40000, 840, 968, 1056, 601, 605, 628, "+", "+"),
+    (1024, 768, 60):   (65000, 1048, 1184, 1344, 771, 777, 806, "-", "-"),
+    (1152, 864, 75):   (108000, 1216, 1344, 1600, 865, 868, 900, "+", "+"),
+    (1280, 720, 50):   (74250, 1720, 1760, 1980, 725, 730, 750, "+", "+"),
+    (1280, 720, 60):   (74250, 1390, 1430, 1650, 725, 730, 750, "+", "+"),
+    (1280, 800, 60):   (83500, 1352, 1480, 1680, 803, 809, 831, "-", "+"),
+    (1280, 1024, 60):  (108000, 1328, 1440, 1688, 1025, 1028, 1066, "+", "+"),
+    (1360, 768, 60):   (85500, 1424, 1536, 1792, 771, 777, 795, "+", "+"),
+    (1440, 900, 60):   (106500, 1520, 1672, 1904, 903, 909, 934, "-", "+"),
+    (1600, 900, 60):   (108000, 1624, 1704, 1800, 901, 904, 1000, "+", "+"),
+    (1600, 1200, 60):  (162000, 1664, 1856, 2160, 1201, 1204, 1250, "+", "+"),
+    (1680, 1050, 60):  (146250, 1784, 1960, 2240, 1053, 1059, 1089, "-", "+"),
+    (1920, 1080, 50):  (148500, 2448, 2492, 2640, 1084, 1089, 1125, "+", "+"),
+    (1920, 1080, 60):  (148500, 2008, 2052, 2200, 1084, 1089, 1125, "+", "+"),
+    (1920, 1200, 60):  (154000, 1968, 2000, 2080, 1203, 1209, 1235, "+", "-"),
+    (2048, 1536, 60):  (209250, 2192, 2416, 2752, 1537, 1540, 1584, "-", "+"),
+}
+
+
+def std_modeline(w, h, refresh):
+    """The published modeline for a standard mode, or None if we don't know that mode.
+    Refresh is matched loosely — a monitor reporting 59.94 or 59.99 means 60."""
+    t = STD_TIMINGS.get((int(w), int(h), int(round(float(refresh)))))
+    if not t:
+        return None
+    pclk, hss, hse, htot, vss, vse, vtot, hpol, vpol = t
+    return ("modeline %.2f %d %d %d %d %d %d %d %d %shsync %svsync"
+            % (pclk / 1000.0, w, hss, hse, htot, h, vss, vse, vtot, hpol, vpol))
+
+
+def connector_has_edid(name):
+    """Does this output publish an EDID? A display with none cannot describe itself, so
+    the kernel can only guess its timings — see STD_TIMINGS. (An active VGA->HDMI
+    converter typically does not pass the monitor's EDID back to the GPU, leaving the
+    connector's EDID literally 0 bytes.)"""
+    for path in glob.glob(os.path.join(DRM_CLASS, "card*-" + str(name), "edid")):
+        try:
+            with open(path, "rb") as f:      # sysfs attrs always stat as 0 bytes —
+                return len(f.read()) > 0     # the content has to actually be read
+        except OSError:
+            return False
+    return True     # unknown connector: assume it is fine, never volunteer modes
+
+
+def standard_modes_for(name):
+    """Modes to OFFER on an EDID-less output, as availableModes strings.
+
+    Such an output arrives with whatever handful of low-res fallbacks the kernel felt
+    safe inventing (typically topping out at 1024x768), so the UI has nothing worth
+    picking — the user's actual panel is invisible to us. We cannot know what the panel
+    is (no EDID means no EDID), so we do not guess: we offer the standard modes the GPU
+    can physically drive and let the person who can SEE the screen choose. Their pick is
+    then emitted as a real standard timing, not a synthesized one."""
+    if connector_has_edid(name):
+        return []
+    out = []
+    for (w, h, r) in sorted(STD_TIMINGS, key=lambda k: (-k[0] * k[1], -k[2])):
+        ml = std_modeline(w, h, r)
+        if ml and not mode_beyond_gpu(name, ml):    # never offer what the GPU can't scan out
+            out.append("%dx%d@%.2fHz" % (w, h, r))
+    return out
+
+
+def is_modeline(mode):
+    """A pinned timing: `modeline <pclk_mhz> <h...> <v...> +hsync +vsync`."""
+    return str(mode or "").strip().lower().startswith("modeline ")
+
+
 def mode_pixel_clock(mode):
-    """Estimated pixel clock in Hz for a 'WxH@R' mode string, or None when the mode is
-    not a concrete one ('preferred', 'highres', 'highrr')."""
-    m = re.match(r"\s*(\d+)x(\d+)@([\d.]+)", str(mode or ""))
+    """Pixel clock in Hz for a mode, or None when it is not a concrete one
+    ('preferred', 'highres', 'highrr'). A modeline states its clock outright — no
+    estimating needed; a 'WxH@R' mode is estimated from the pixel rate."""
+    mode = str(mode or "")
+    if is_modeline(mode):
+        m = re.match(r"\s*modeline\s+([\d.]+)", mode, re.I)
+        return float(m.group(1)) * 1e6 if m else None
+    m = re.match(r"\s*(\d+)x(\d+)@([\d.]+)", mode)
     if not m:
         return None
     return int(m.group(1)) * int(m.group(2)) * float(m.group(3)) * BLANKING_OVERHEAD
@@ -474,7 +588,9 @@ def crtc_overcommit(specs):
     return None
 
 
-CONN_STAMP = re.compile(r"^--\s*hz:conn\s+(\S+)\s+(\S+)\s+(\S+)")
+# `-- hz:conn <connector> <driver>:<device> <mode>` — mode runs to end of line, because
+# a pinned timing is a whole modeline, spaces and all.
+CONN_STAMP = re.compile(r"^--\s*hz:conn\s+(\S+)\s+(\S+)\s+(.+?)\s*$")
 
 
 def audit_monitors_lua():
@@ -1127,7 +1243,9 @@ class HyperZone:
             by_name.setdefault(m["name"], m)
         old = {mon.ident: mon for mon in self.mons.values()}   # preserve by identity
         self.mons = {}
-        for key, cfg in MANAGED.items():
+        # No config yet (fresh install) -> fall back to the primary monitor, resolved
+        # from what is actually plugged in rather than a guessed connector name.
+        for key, cfg in (MANAGED or default_managed(live)).items():
             if not cfg.get("enabled", True):        # skip toggled-off monitors
                 continue
             info = by_key.get(key) or by_name.get(key)
@@ -1679,7 +1797,18 @@ class Daemon(HyperZone):
 
     # -- monitor / config snapshots for the UI --
     def live_monitors(self):
-        return hjson("monitors", "all") or hjson("monitors") or []
+        """Live monitors — with standard modes offered on any output that publishes no
+        EDID. Such an output only ever arrives with the handful of low-res fallbacks the
+        kernel felt safe inventing (typically nothing above 1024x768), so without this
+        the UI has nothing worth picking and the display is simply stuck there, however
+        capable the panel behind it actually is. See standard_modes_for."""
+        mons = hjson("monitors", "all") or hjson("monitors") or []
+        for m in mons:
+            offered = standard_modes_for(m.get("name"))
+            if offered:
+                have = [x for x in (m.get("availableModes") or []) if x not in offered]
+                m["availableModes"] = offered + have
+        return mons
 
     def effective_config(self):
         """The config the UI edits: the user's config.json (source form, so the
@@ -1690,6 +1819,8 @@ class Daemon(HyperZone):
         user_managed = USER_CONFIG.get("managed", {})
         live = self.live_monitors()
         ids = identify_monitors(live)
+        # Only consulted on a fresh install (no `managed` saved yet) — see default_managed.
+        builtin = default_managed(live) if not user_managed else {}
         managed = {}
         for m in live:
             name = m.get("name")
@@ -1701,10 +1832,8 @@ class Daemon(HyperZone):
             if saved is not None:
                 entry = dict(saved)
                 entry.setdefault("enabled", True)
-            else:   # not user-configured: managed only if the built-in default is
-                builtin = (not user_managed and name in MANAGED
-                           and MANAGED[name].get("enabled", True))
-                entry = {"enabled": bool(builtin)}
+            else:   # not user-configured: managed only if it IS the built-in default
+                entry = {"enabled": ids[name][0] in builtin}
             if "cells" not in entry:
                 entry.setdefault("layout", dict(DEFAULT_LAYOUT))
             managed[name] = entry
@@ -1811,9 +1940,15 @@ class Daemon(HyperZone):
         cfg = params.get("config")
         if not isinstance(cfg, dict):
             raise ValueError("missing/invalid config")
-        if isinstance(cfg.get("managed"), dict):
-            cfg = dict(cfg)                       # persist identity-keyed, not by port
+        cfg = dict(cfg)
+        if isinstance(cfg.get("managed"), dict):  # persist identity-keyed, not by port
             cfg["managed"] = self._managed_by_identity(cfg["managed"])
+        # Settings.qml assembles the config it saves from the fields it knows about, and
+        # it knows nothing about modelines — so an unrelated edit (a keybind, a colour)
+        # would drop a pinned timing on the floor. Carry it over unless it is explicitly
+        # being set.
+        if "modelines" not in cfg and USER_CONFIG.get("modelines"):
+            cfg["modelines"] = USER_CONFIG["modelines"]
         old_sig = self._tiling_sig()
         apply_config(cfg)              # validates first -> globals untouched on error
         self._write_config(cfg)
@@ -1949,6 +2084,37 @@ class Daemon(HyperZone):
         if hypr_request("reload") is None:
             subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=5)
 
+    @staticmethod
+    def pin_mode(key, name, mode):
+        """The mode we ACTUALLY set for a monitor, given the one that was asked for.
+
+        For a normal monitor this returns `mode` untouched — everything below is inert
+        unless the display fails to publish an EDID.
+
+        For an EDID-less one it returns an explicit standard timing instead, because a
+        bare 'WxH@R' would let the kernel synthesize a GTF/CVT timing that sinks which
+        sample the signal (analog converters, KVMs, scalers) routinely mis-lock onto.
+        Two sources, in order:
+          1. an explicit `modelines` entry in config.json, keyed by stable identity or by
+             connector name — the escape hatch for a panel whose timing isn't standard;
+          2. otherwise the published VESA/CEA timing for that resolution (STD_TIMINGS).
+
+        It deliberately OVERRIDES the requested mode rather than merely defaulting: the
+        UI and the live state both speak in 'WxH@R', so without this, the next unrelated
+        display edit would round-trip a synthesized timing straight back into
+        monitors.lua and quietly undo the fix."""
+        ml = USER_CONFIG.get("modelines") or {}
+        pinned = ml.get(key) or ml.get(name)
+        if pinned:
+            return pinned
+        if is_modeline(mode) or connector_has_edid(name):
+            return mode
+        m = re.match(r"\s*(\d+)x(\d+)@([\d.]+)", str(mode or ""))
+        if not m:
+            return mode                      # 'preferred' & friends: leave well alone
+        std = std_modeline(int(m.group(1)), int(m.group(2)), float(m.group(3)))
+        return std or mode
+
     def _live_specs(self):
         """Current live monitors as generator specs (basis for revert / first monitors.lua).
         `desc` is set only when the description is a USABLE identity — unique and
@@ -1963,9 +2129,10 @@ class Daemon(HyperZone):
             if m.get("disabled"):
                 specs.append({"name": m["name"], "desc": desc, "disabled": True})
             else:
-                specs.append({"name": m["name"], "desc": desc,
-                              "mode": "%dx%d@%.2f" % (m["width"], m["height"],
-                                                      float(m.get("refreshRate", 60))),
+                mode = self.pin_mode(key, m["name"],
+                                     "%dx%d@%.2f" % (m["width"], m["height"],
+                                                     float(m.get("refreshRate", 60))))
+                specs.append({"name": m["name"], "desc": desc, "mode": mode,
                               "x": m.get("x", 0), "y": m.get("y", 0),
                               "scale": m.get("scale", 1), "transform": m.get("transform", 0)})
         return specs
@@ -2003,10 +2170,20 @@ class Daemon(HyperZone):
             if m.get("disabled"):
                 specs.append({"name": name, "desc": desc, "disabled": True})
                 continue
-            mode = str(m.get("mode", "preferred"))
+            # On an EDID-less output the requested mode becomes an explicit standard
+            # timing — the kernel's synthesized one is what breaks converters. Resolve
+            # that BEFORE validating: the UI preselects the monitor's live mode, whose
+            # reported refresh (e.g. 59.80Hz) need not appear verbatim in the offered
+            # list, but rounds to a standard mode perfectly well.
+            requested = str(m.get("mode", "preferred"))
+            mode = self.pin_mode(key, name, requested)
             modes = [str(x) for x in live[name].get("availableModes", [])]
-            if mode not in modes and mode not in ("preferred", "highres", "highrr"):
-                raise ValueError("monitor %s: mode %r not available" % (name, mode))
+            if (not is_modeline(mode) and mode not in modes
+                    and mode not in ("preferred", "highres", "highrr")):
+                raise ValueError("monitor %s: mode %r not available" % (name, requested))
+            if mode != requested:
+                log("monitor %s: no EDID — pinned %s to a standard timing: %s"
+                    % (name, requested, mode))
             # availableModes trusts the MONITOR (it is EDID-derived, and an EDID can be
             # cloned, injected or simply wrong). This trusts the GPU instead: refuse a
             # mode the card cannot physically scan out, whatever the panel claims.
