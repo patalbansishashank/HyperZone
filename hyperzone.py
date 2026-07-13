@@ -1888,6 +1888,40 @@ class Daemon(HyperZone):
             json.dump(cfg, f, indent=2)
         os.replace(tmp, CONFIG_PATH)   # atomic: a crash can't leave a half file
 
+    def heal_edidless_modes(self):
+        """Repair a monitors.lua that drives an EDID-less output with a plain 'WxH@R'.
+
+        Such a line makes Hyprland SYNTHESIZE a timing at every boot (GTF/CVT — e.g.
+        2576x1120 @173 MHz for 1080p60, where the published standard is 2200x1125
+        @148.5 MHz), which is precisely what makes a sampling sink — an analog converter,
+        a KVM, a scaler — mis-lock and letterbox the picture. We already know the right
+        timing for that mode, so a file that asks for the wrong one is simply stale, and
+        the fix does not need a human: leaving it be would mean the user reboots into a
+        squashed display and has to rediscover the workaround.
+
+        Bounded on purpose: it only ever touches outputs with no EDID (they are the only
+        ones pin_mode turns into a modeline), only when the file does not already carry
+        that exact timing, and the mode goes through the same GPU ceiling check as any
+        other. Idempotent — a healed file heals to itself."""
+        if not hyprland_is_migrated() or not os.path.exists(MONITORS_LUA):
+            return
+        try:
+            with open(MONITORS_LUA) as f:
+                text = f.read()
+        except OSError:
+            return
+        specs = self._live_specs()          # pin_mode has already resolved each mode
+        stale = [s for s in specs
+                 if is_modeline(s.get("mode")) and s["mode"] not in text]
+        if not stale:
+            return
+        for s in stale:
+            log("healing %s: monitors.lua drove it with a mode Hyprland had to "
+                "synthesize — pinning the standard timing instead: %s"
+                % (s["name"], s["mode"]))
+        _atomic_write(MONITORS_LUA, generate_monitors_lua(specs))
+        self._apply_live_specs(stale)       # and fix the picture now, not next boot
+
     def warn_stale_conn_keys(self):
         """Warn about a config entry keyed by connector name whose port now carries a
         display that CAN identify itself.
@@ -3325,6 +3359,7 @@ class Daemon(HyperZone):
         lua_warnings = audit_monitors_lua()
         for w in lua_warnings:
             log("WARNING:", w)
+        self.heal_edidless_modes()  # a synthesized timing on an EDID-less output is a bug
         self.retile(restore=True)   # restore prior layout if the daemon restarted
         for a in list(self.painted):  # re-assert amber on windows we had painted
             self.paint(a, True)
