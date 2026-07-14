@@ -675,13 +675,45 @@ def _output_selector(spec):
     return spec["name"]
 
 
-def generate_monitors_lua(specs):
+_LUA_BLOCK = re.compile(r"((?:--[^\n]*\n)*)(hl\.monitor\(\{.*?\}\))", re.S)
+
+
+def _kept_blocks(keep_text, specs):
+    """Blocks from an existing monitors.lua that belong to no spec being written —
+    i.e. displays that are OFF or unplugged right now. Specs are always built from
+    the live monitors, so regenerating the file used to silently forget every
+    display the user happened to have powered down: its saved mode and position
+    were gone by the next time it was switched on. A block is claimed (and thus
+    dropped, because the fresh specs supersede it) when its output selector matches
+    a live monitor by desc: OR by connector name — either may have been the keying
+    of the old block. Each kept block keeps its hz:conn stamp, so the boot audit
+    still re-checks it."""
+    claimed = set()
+    for s in specs:
+        claimed.add(_output_selector(s))
+        claimed.add(s["name"])
+        if s.get("desc"):
+            claimed.add("desc:" + s["desc"])
+    kept = []
+    for comments, block in _LUA_BLOCK.findall(keep_text or ""):
+        m = re.search(r'output\s*=\s*"([^"]+)"', block)
+        if not m or m.group(1) in claimed:
+            continue
+        kept.append((comments.strip("\n") + "\n" if comments.strip() else "") + block)
+    return kept
+
+
+def generate_monitors_lua(specs, keep_text=""):
     """Render monitor specs into hl.monitor({...}) blocks. Each spec:
     {name, desc, mode, x, y, scale, transform} or {name, desc, disabled:true}.
     `mode` may be an availableModes string ('1920x1080@60.00Hz') — the 'Hz' suffix
     is stripped to the 'WxH@R' form the Hyprland config parser expects. Monitors
     are keyed by desc: (see _output_selector) so the config survives connector-name
     churn across GPU-topology changes.
+
+    `keep_text` is the previous file content; blocks in it for monitors that are
+    not in `specs` (displays currently off/unplugged) are carried over verbatim,
+    so a regeneration never forgets a display that merely isn't on right now.
 
     Two safety rules apply here, because this file is read at BOOT — when nothing of
     ours is running to second-guess it:
@@ -723,6 +755,15 @@ def generate_monitors_lua(specs):
         if int(m.get("transform", 0)):
             out.append('    transform = %d,' % int(m["transform"]))
         out += ["})", ""]
+    kept = _kept_blocks(keep_text, specs)
+    if kept:
+        # blank line after the banner: comment lines that touch an hl.monitor block
+        # are treated as THAT block's stamp by _kept_blocks on the next regeneration
+        out.append("-- displays below are not connected right now; kept so they come")
+        out.append("-- back with their saved mode and position when switched on")
+        out.append("")
+        for block in kept:
+            out += [block, ""]
     return "\n".join(out) + "\n"
 
 
@@ -1930,7 +1971,7 @@ class Daemon(HyperZone):
             log("healing %s: monitors.lua drove it with a mode Hyprland had to "
                 "synthesize — pinning the standard timing instead: %s"
                 % (s["name"], s["mode"]))
-        _atomic_write(MONITORS_LUA, generate_monitors_lua(specs))
+        _atomic_write(MONITORS_LUA, generate_monitors_lua(specs, keep_text=text))
         self._apply_live_specs(stale)       # and fix the picture now, not next boot
 
     def warn_stale_conn_keys(self):
@@ -1986,6 +2027,23 @@ class Daemon(HyperZone):
             out[key if key in keys else name2key.get(key, key)] = mc
         return out
 
+    @staticmethod
+    def _keep_offline_entries(new_managed, saved_managed, live):
+        """A save from the UI describes only the monitors the UI can SEE — the live
+        ones (effective_config lists exactly those). Every saved entry belonging to
+        a display that is off or unplugged right now must survive the save
+        untouched, or powering a monitor down and then changing ANY setting would
+        silently delete its zones — and the next time it is switched on it would
+        come up unmanaged."""
+        if not isinstance(saved_managed, dict):
+            return new_managed
+        ids = identify_monitors(live)
+        live_keys = set(ids) | {key for key, _ in ids.values()}
+        for key, mc in saved_managed.items():
+            if key not in live_keys:
+                new_managed.setdefault(key, mc)
+        return new_managed
+
     def rpc_set_config(self, params):
         global USER_CONFIG
         cfg = params.get("config")
@@ -1993,7 +2051,9 @@ class Daemon(HyperZone):
             raise ValueError("missing/invalid config")
         cfg = dict(cfg)
         if isinstance(cfg.get("managed"), dict):  # persist identity-keyed, not by port
-            cfg["managed"] = self._managed_by_identity(cfg["managed"])
+            cfg["managed"] = self._keep_offline_entries(
+                self._managed_by_identity(cfg["managed"]),
+                USER_CONFIG.get("managed"), self.live_monitors())
         # Settings.qml assembles the config it saves from the fields it knows about, and
         # it knows nothing about modelines — so an unrelated edit (a keybind, a colour)
         # would drop a pinned timing on the floor. Carry it over unless it is explicitly
@@ -2271,12 +2331,18 @@ class Daemon(HyperZone):
         # snapshot the exact current live state so revert is exact
         self.layout_prev_specs = self._live_specs()
         migrated = hyprland_is_migrated()
+        prev_text = ""
         if migrated and os.path.exists(MONITORS_LUA):
             shutil.copyfile(MONITORS_LUA, MONITORS_LUA + ".pending-backup")
+            try:
+                with open(MONITORS_LUA) as f:
+                    prev_text = f.read()
+            except OSError:
+                pass
         self._apply_live_specs(specs)                       # <- takes effect now
         self.learn_suppress_until = time.time() + LEARN_SUPPRESS_APPLY       # windows are in flux
         if migrated:
-            _atomic_write(MONITORS_LUA, generate_monitors_lua(specs))
+            _atomic_write(MONITORS_LUA, generate_monitors_lua(specs, keep_text=prev_text))
         timeout_s = float(params.get("timeout_s", REVERT_TIMEOUT))
         self.layout_revert_at = time.time() + timeout_s
         # Hyprland reports the new mode/scale/transform a beat AFTER the eval
@@ -2403,6 +2469,11 @@ class Daemon(HyperZone):
             elif name.startswith("monitoradded") or name.startswith("monitorremoved"):
                 self.warn_stale_conn_keys()  # a re-plugged panel may now publish an EDID
                 self.reseed()        # monitor hot-plug: drop/keep managed monitors
+                # Hyprland finishes wiring a hot-plugged monitor (geometry, reserved
+                # areas) a beat after the event; a settled second pass re-seeds and
+                # re-applies so the new screen's zones are live even if the first
+                # read raced that.
+                self.monitors_refresh_at = time.time() + SETTLE_READ_DELAY
                 self.emit("monitors_changed", {"monitors": self.live_monitors()})
             elif name.startswith("configreloaded"):
                 refresh_gaps()       # gaps/border may have changed -> re-lay-out
