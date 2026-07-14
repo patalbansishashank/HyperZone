@@ -182,14 +182,14 @@ ColumnLayout {
     rev++
   }
   function setSplit(name, v, h) { var l = layoutOf(name); l.vsplit = v; if (h !== undefined && h !== null) l.hsplit = h }
-  function setFillOrder(name, fill) { layoutOf(name).fill = fill }
+  function setFillOrder(name, fill) { layoutOf(name).fill = fill; rev++ }
   function toggleSub(name, zi, on) {
     var l = layoutOf(name); var s = (l.subdivide || []).slice(); var i = s.indexOf(zi)
     if (on && i < 0) s.push(zi)
     if (!on && i >= 0) s.splice(i, 1)
     l.subdivide = s; rev++
   }
-  function setSubOrder(name, order) { layoutOf(name).subdivide = order }
+  function setSubOrder(name, order) { layoutOf(name).subdivide = order; rev++ }
 
   function fillModel(name) {
     var l = layoutOf(name); var sub = l.subdivide || []
