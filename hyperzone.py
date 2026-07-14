@@ -201,6 +201,18 @@ KEYBIND_CMDS = {
     "swap-up": "swap up", "swap-down": "swap down",
     "toggle-float": "toggle-float", "rearrange": "rearrange", "retile": "retile",
 }
+# Actions bound STRAIGHT to a Hyprland dispatcher instead of round-tripping through
+# hzctl: nothing about them needs the tiler, so a press shouldn't wait on a Python
+# start-up, and closing a window keeps working even while the daemon is busy.
+#   close = ask the WINDOW to close (polite; a tray app like Discord just hides)
+#   kill  = SIGKILL the PROCESS behind it — per-PROCESS, so EVERY window that process
+#           owns dies too (all Chromium profile windows share one browser process; all
+#           Unreal Editor panels share the editor's). No save prompt, no cleanup.
+KEYBIND_LUA = {
+    "close-window": "hl.dsp.window.close()",
+    "kill-window": "hl.dsp.window.kill()",
+}
+KEYBIND_ACTIONS = set(KEYBIND_CMDS) | set(KEYBIND_LUA)
 DEFAULT_KEYBINDS = {
     "focus-left": ["SUPER + left", "SUPER + H"],
     "focus-right": ["SUPER + right", "SUPER + L"],
@@ -225,6 +237,8 @@ DEFAULT_KEYBINDS = {
     "toggle-float": ["SUPER + T"],
     "rearrange": ["SUPER + SHIFT + T"],
     "retile": ["SUPER + SHIFT + R"],
+    "close-window": ["SUPER + Q"],
+    "kill-window": ["SUPER + SHIFT + Q"],
 }
 KEYBINDS = {k: list(v) for k, v in DEFAULT_KEYBINDS.items()}
 KEYBIND_MARKER = "-- hyperzone-managed keybinds"
@@ -239,7 +253,7 @@ def merge_keybinds(user):
     merged = {k: list(v) for k, v in DEFAULT_KEYBINDS.items()}
     if isinstance(user, dict):
         for act, combos in user.items():
-            if act in KEYBIND_CMDS and isinstance(combos, list):
+            if act in KEYBIND_ACTIONS and isinstance(combos, list):
                 merged[act] = [str(c) for c in combos]
     return merged
 
@@ -313,7 +327,7 @@ def validate_config(cfg):
         if not isinstance(kb, dict):
             raise ValueError("keybinds must be an object")
         for act, combos in kb.items():
-            if act not in KEYBIND_CMDS:
+            if act not in KEYBIND_ACTIONS:
                 raise ValueError("unknown keybind action: %s" % act)
             if not isinstance(combos, list) or not all(isinstance(c, str) for c in combos):
                 raise ValueError("keybinds.%s must be a list of strings" % act)
@@ -2157,6 +2171,8 @@ class Daemon(HyperZone):
 
     # -- keybinds (registered live via Hyprland's Lua `eval`) --
     def _keybind_expr(self, combo, action):
+        if action in KEYBIND_LUA:      # native dispatcher — no hzctl round-trip
+            return 'hl.bind("%s", %s)' % (combo, KEYBIND_LUA[action])
         return 'hl.bind("%s", hl.dsp.exec_cmd("%s %s"))' % (
             combo, HZCTL_CMD, KEYBIND_CMDS[action])
 
@@ -2241,13 +2257,20 @@ class Daemon(HyperZone):
         `hl.bind(... hyperzone .. " <verb> ...")` (matched by the hzctl subcommand, so
         the mouse drag-binds are left alone) or a native DIRECTIONAL focus bind
         `hl.bind(... hl.dsp.focus({direction=...}))` (workspace-focus binds have
-        `workspace=`, not `direction`, so they stay)."""
+        `workspace=`, not `direction`, so they stay), or a window close/kill bind
+        (`hl.dsp.window.close/kill`), which we now own as close-window / kill-window.
+
+        The bind may be ASSIGNED to a variable (`local closeWindowBind = hl.bind(...)`),
+        so match hl.bind( anywhere on the line — but never on an already-commented one,
+        or a re-scan would keep stacking `-- ` prefixes."""
         s = line.strip()
-        if not s.startswith("hl.bind(") or "mouse" in s:
+        if s.startswith("--") or "hl.bind(" not in s or "mouse" in s:
             return False
         if "hyperzone" in s:
             m = re.search(r'hyperzone\s*\.\.\s*"\s*([a-z-]+)', s)
             return bool(m) and m.group(1) in _KB_VERBS
+        if "hl.dsp.window.close(" in s or "hl.dsp.window.kill(" in s:
+            return True
         return "hl.dsp.focus(" in s and "direction" in s
 
     def rpc_retile(self, params):

@@ -86,9 +86,12 @@ ColumnLayout {
     { title: "Move across everything", desc: "Rearrange in-screen, then spill to the next monitor at the edge",
       items: [{ id: "push-left", label: "Push left" }, { id: "push-right", label: "Push right" },
               { id: "push-up", label: "Push up" }, { id: "push-down", label: "Push down" }] },
-    { title: "Swap window", desc: "Swap the focused window with the one in that direction — works across screens too",
+    { title: "Swap window", desc: "Trade places with the window in that direction — works across screens too. Focus follows the AREA: the window that arrives where you were working takes focus, so you keep looking at the same spot",
       items: [{ id: "swap-left", label: "Swap ← left" }, { id: "swap-right", label: "Swap → right" },
               { id: "swap-up", label: "Swap ↑ up" }, { id: "swap-down", label: "Swap ↓ down" }] },
+    { title: "Close window", desc: "Close asks the window to close — an app that lives in the tray (Discord, Steam) just hides and keeps running. Force kill SIGKILLs the process instead: no save prompt, no cleanup, and it takes EVERY window that process owns (all Chromium profile windows share one process; so do all Unreal Editor panels)",
+      items: [{ id: "close-window", label: "Close window" },
+              { id: "kill-window", label: "Force kill app (no save!)" }] },
     { title: "Actions", desc: "Re-tile re-snaps windows into their zones · Rearrange is a hard reset that also reclaims floated windows",
       items: [{ id: "toggle-float", label: "Toggle float" }, { id: "rearrange", label: "Rearrange all" },
               { id: "retile", label: "Re-tile / re-snap" }] },
@@ -104,7 +107,8 @@ ColumnLayout {
     "push-up": ["SUPER + CTRL + SHIFT + up"], "push-down": ["SUPER + CTRL + SHIFT + down"],
     "swap-left": ["SUPER + ALT + left"], "swap-right": ["SUPER + ALT + right"],
     "swap-up": ["SUPER + ALT + up"], "swap-down": ["SUPER + ALT + down"],
-    "toggle-float": ["SUPER + T"], "rearrange": ["SUPER + SHIFT + T"], "retile": ["SUPER + SHIFT + R"]
+    "toggle-float": ["SUPER + T"], "rearrange": ["SUPER + SHIFT + T"], "retile": ["SUPER + SHIFT + R"],
+    "close-window": ["SUPER + Q"], "kill-window": ["SUPER + SHIFT + Q"]
   })
   function combosOf(id) { var k = edit.keybinds || {}; return (k[id] || []).slice() }
   function setCombos(id, arr) {
