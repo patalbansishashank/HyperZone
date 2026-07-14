@@ -1207,6 +1207,15 @@ class HyperZone:
         self.reconcile_needed = False   # a fullscreen event arrived; reconcile once
         self.unfs_at = {}           # addr -> when we last un-fullscreened it
         self.focused = None         # last-focused managed window (overflow splits it)
+        self.focus_after_flush = None   # (addr, (cx, cy)) — focus a window and park the
+                                    # cursor there, but only AFTER the next geometry flush.
+                                    # A swap exchanges two zones' contents, and apply() only
+                                    # marks the monitor dirty: at cmd_swap time the windows
+                                    # have NOT moved yet, so focusing/warping there would drop
+                                    # the pointer on the partner's OLD rect — and follow_mouse
+                                    # would hand focus straight back to the driven window once
+                                    # it landed under the cursor. Deferring to flush() dispatches
+                                    # it when the windows are already at their final rects.
         self.painted = set()        # addrs we painted amber (so we only ever repaint
                                     # windows WE touched — pristine ones stay config)
         self.was_managed = set()    # addrs we managed that have since left for an
@@ -1693,6 +1702,20 @@ class HyperZone:
             due = time.time() + FLUSH_VERIFY_DELAY
             if self.verify_at is None or due < self.verify_at:
                 self.verify_at = due
+        if self.focus_after_flush:
+            # A swap asked for focus to land on the window that ARRIVED in the zone the
+            # user was working in. Dispatch it here, with the geometry batch already sent.
+            # CURSOR FIRST, FOCUS LAST — the same order _focus_window() uses, and for a
+            # sharper reason here: the windows are still ANIMATING out of each other's
+            # zones, so a warp into the zone hit-tests against the outgoing window, and
+            # mouse_refocus (default on, with follow_mouse=1) hands focus right back to it.
+            # Warping first lets that misfire happen BEFORE our focus dispatch, which then
+            # has the last word; when the animation settles, the arriving window is the one
+            # under the parked cursor, so any later re-evaluation re-confirms it.
+            addr, (cx, cy) = self.focus_after_flush
+            self.focus_after_flush = None
+            hbatch(['hl.dsp.cursor.move({x=%d,y=%d})' % (cx, cy),
+                    'hl.dsp.focus({window="address:%s"})' % addr])
 
     def _apply_now(self, mon):
         self._apply_count += 1
@@ -2993,7 +3016,12 @@ class Daemon(HyperZone):
         across screens: same monitor -> exchange the two zone slots in the tree;
         different monitors -> each window takes the other's zone on the other monitor.
         Nothing else in the layout is disturbed, and if there's no window that way the
-        focused one simply stays put."""
+        focused one simply stays put.
+
+        The windows move; the USER doesn't. Focus (and the cursor with it — follow_mouse
+        makes them inseparable) lands on the window that just arrived in the area the user
+        was already working in, so the gesture reads as "put a different window HERE, and
+        let me work on it" rather than "carry me off to wherever my window went"."""
         c = self.client(addr)
         if not c:
             return
@@ -3010,14 +3038,25 @@ class Daemon(HyperZone):
             if mon_a is not None and mon_a is mon_b:
                 la, lb = mon_a.leaf_of(addr), mon_a.leaf_of(other)
                 if la and lb:
+                    ax, ay, aw, ah = la[2]          # MY zone — the area I'm working in
                     la[1]["win"], lb[1]["win"] = other, addr
                     self.reprobe_min(addr)
                     self.reprobe_min(other)
                     self.apply(mon_a)
+                    # `other` now owns the zone I was looking at, so focus follows the
+                    # AREA, not the window: deferred to flush(), once it's actually there.
+                    self.focus_after_flush = (other, (mon_a.ox + ax + aw // 2,
+                                                      mon_a.oy + ay + ah // 2))
             else:
                 # one of them isn't in our grid (a native/floating window): let
-                # Hyprland swap the two tiled windows the ordinary way
-                hbatch(['hl.dsp.window.swap({direction="%s"})' % direction])
+                # Hyprland swap the two tiled windows the ordinary way. It applies
+                # synchronously within the batch, so by the time focus runs `other`
+                # already sits in my old rect — focus it and park the cursor there.
+                at, sz = c.get("at") or [0, 0], c.get("size") or [0, 0]
+                hbatch(['hl.dsp.window.swap({direction="%s"})' % direction,
+                        'hl.dsp.cursor.move({x=%d,y=%d})'
+                        % (at[0] + sz[0] // 2, at[1] + sz[1] // 2),
+                        'hl.dsp.focus({window="address:%s"})' % other])
             return
         self._swap_across(addr, mon_a, c, other, mon_b, tgt, direction)
 
@@ -3030,7 +3069,8 @@ class Daemon(HyperZone):
         steered into the vacated zone by a one-shot cross_place intent (swap_pending
         forces the adoption, since an emptied-out floating window passes neither
         is_tileable nor was_ours). A window whose destination isn't a managed monitor
-        just docks there natively. Focus follows the window the user was driving."""
+        just docks there natively. Focus lands on the window that ARRIVES in the zone the
+        user was working in; their cursor and attention never leave their monitor."""
         id2name = {m.get("id"): m.get("name") for m in self.monitors_cached()}
         a_dest = id2name.get(tgt.get("monitor"))     # addr -> other's monitor (by name)
         b_dest = id2name.get(ca.get("monitor"))      # other -> addr's monitor
@@ -3078,12 +3118,18 @@ class Daemon(HyperZone):
             self.swap_pending.add(other)
         self.reprobe_min(addr)
         self.reprobe_min(other)
-        bx, by, bw, bh = b_rect
+        # Same rule as a same-monitor swap: my attention stays where it is. The two
+        # move({monitor=}) dispatches reassign output membership immediately, so by the
+        # time focus runs `other` is already on MY monitor — no cross-monitor focus flash
+        # — and the cursor parks in the rect I vacated, which is where cross_place is
+        # about to land `other`. (Dispatched inline, NOT via focus_after_flush: `other`'s
+        # zone is settled on a LATER flush driven by the movewindowv2 event.)
+        ax, ay, aw, ah = a_rect
         hbatch([
             'hl.dsp.window.move({monitor="%s", window="address:%s"})' % (a_dest, addr),
             'hl.dsp.window.move({monitor="%s", window="address:%s"})' % (b_dest, other),
-            'hl.dsp.cursor.move({x=%d,y=%d})' % (bx + bw // 2, by + bh // 2),
-            'hl.dsp.focus({window="address:%s"})' % addr,   # focus follows the driven window
+            'hl.dsp.cursor.move({x=%d,y=%d})' % (ax + aw // 2, ay + ah // 2),
+            'hl.dsp.focus({window="address:%s"})' % other,   # the window arriving where I was
         ])
 
     def cmd_toggle_float(self, addr):
