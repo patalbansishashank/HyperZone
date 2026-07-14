@@ -1229,6 +1229,15 @@ class HyperZone:
         self._last_size = {}        # addr -> size at the previous verify read; a size
                                     # must repeat (stable) before we learn from it
         self._apply_count = 0       # geometry passes done (log/diagnostics only)
+        self._recommit1 = set()     # resized windows awaiting the recommit nudge: some
+        self._recommit2 = set()     # clients (Chromium) drop a configure that lands in
+                                    # a burst and keep a stale too-small buffer — the
+                                    # window renders only its top part until the NEXT
+                                    # resize. Once the layout settles, run_verify sends
+                                    # each such window one isolated +1px resize then the
+                                    # exact size again (two clean configures, 1px is
+                                    # inside DRIFT_PX so nothing else reacts) — the
+                                    # "move it away and back" hand-fix, automated.
         self._mon_cache = (0.0, None)   # (fetched_at, monitors list) micro-cache
         self.reseed()
 
@@ -1542,6 +1551,7 @@ class HyperZone:
         reanchor = []
         learned = unsettled = False
         seen = {}
+        recommit = []                # (addr, tw, th, size_ok) nudge candidates
         for mon in self.mons.values():
             for zi, lf, (rx, ry, rw, rh) in mon.leaves():
                 addr = lf["win"]
@@ -1581,19 +1591,50 @@ class HyperZone:
                 if abs(cx - gx) > DRIFT_PX or abs(cy - gy) > DRIFT_PX:
                     reanchor.append('hl.dsp.window.move({x=%d,y=%d, window="address:%s"})'
                                     % (gx, gy, addr))
+                if addr in self._recommit1 or addr in self._recommit2:
+                    recommit.append((addr, tw, th, not mismatch))
         self._last_size = seen
+        # Recommit nudge (see _recommit1 in __init__): once the layout is settled,
+        # each window whose size we changed gets one +1px resize, then its exact
+        # size on the next pass — two clean, isolated configure events that make
+        # the client commit a fresh full-size buffer even if it dropped one during
+        # the apply burst. 1px sits inside DRIFT_PX, so re-anchor, learning and the
+        # settled checks all ignore the intermediate state.
+        here = {r[0] for r in recommit}
+        self._recommit1 &= here
+        self._recommit2 &= here
+        if not reanchor and not unsettled:
+            nudge = []
+            for addr, tw, th, size_ok in recommit:
+                if not size_ok:              # app insists on its own size: no nudge,
+                    self._recommit1.discard(addr)   # the learned-min path handles it
+                    self._recommit2.discard(addr)
+                elif addr in self._recommit2:
+                    self._recommit2.discard(addr)
+                    nudge.append('hl.dsp.window.resize({x=%d,y=%d, window="address:%s"})'
+                                 % (tw, th, addr))
+                else:
+                    self._recommit1.discard(addr)
+                    self._recommit2.add(addr)
+                    nudge.append('hl.dsp.window.resize({x=%d,y=%d, window="address:%s"})'
+                                 % (tw, th + 1, addr))
+            if nudge:
+                dlog("recommit nudge", len(nudge))
+                hbatch(nudge)
         if learned:
             log("minsize learned:", dict(self.minsize))
             self.save()
         if reanchor:
             dlog("verify re-anchor", len(reanchor), "chase", self._verify_chase)
             hbatch(reanchor)
-        if (reanchor or unsettled) and self._verify_chase < VERIFY_CHASE_MAX:
-            # not settled yet -> read again shortly (bounded). Once sizes are
-            # learned, applies are exact first-pass and this never runs.
+        pending = bool(self._recommit1 or self._recommit2)
+        if (reanchor or unsettled or pending) and self._verify_chase < VERIFY_CHASE_MAX:
+            # not settled yet (or a recommit nudge needs its follow-up pass) ->
+            # read again shortly (bounded). Once sizes are learned, applies are
+            # exact first-pass and this never runs.
             self._verify_chase += 1
             self.verify_at = time.time() + VERIFY_CHASE_DELAY
-        elif not reanchor and not unsettled:
+        elif not reanchor and not unsettled and not pending:
             self._verify_chase = 0
 
     def gc(self):
@@ -1676,9 +1717,26 @@ class HyperZone:
             # command the size the app will actually settle at (zone raised to its
             # learned min) so its async clamp can't re-commit and bump the window
             tw, th = self.want_size((c or {}).get("class"), rw, rh)
-            exprs += float_geom_exprs(addr, tw, th, gx, gy)
             if addr in self.painted:   # tiled again -> back to the config colour
                 repaint.append(addr)
+            # Only touched windows get dispatches. Re-sending the float/resize/move
+            # triple to EVERY window on the monitor made each apply a burst of
+            # configure events at windows that weren't going anywhere — and a client
+            # that drops one mid-burst (Chromium does) keeps a stale, too-small
+            # buffer: the window renders only its top part until something resizes
+            # it again. A window already settled at its target is left alone; one
+            # that only needs anchoring gets a bare move (a move never makes the
+            # client redraw, so it can't corrupt anything).
+            if c and not c.get("fullscreen") and c.get("floating"):
+                cw, ch = c.get("size", [-1, -1])
+                cx, cy = c.get("at", [-1, -1])
+                if abs(cw - tw) <= DRIFT_PX and abs(ch - th) <= DRIFT_PX:
+                    if abs(cx - gx) > DRIFT_PX or abs(cy - gy) > DRIFT_PX:
+                        exprs.append('hl.dsp.window.move({x=%d,y=%d, window="address:%s"})'
+                                     % (gx, gy, addr))
+                    continue
+            exprs += float_geom_exprs(addr, tw, th, gx, gy)
+            self._recommit1.add(addr)  # size is changing -> nudge a clean commit later
         hbatch(exprs)
         for addr in repaint:
             self.paint(addr, False)
@@ -2449,6 +2507,8 @@ class Daemon(HyperZone):
                 self.deny_place.pop(addr, None)
                 self.cross_place.pop(addr, None)
                 self.swap_pending.discard(addr)
+                self._recommit1.discard(addr)
+                self._recommit2.discard(addr)
                 self.remove(addr)
                 self.detached.discard(addr)
                 self.painted.discard(addr)
