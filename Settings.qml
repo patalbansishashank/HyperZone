@@ -245,6 +245,27 @@ ColumnLayout {
     return modes.length ? modes[0] : (pfx + (m.refreshRate || 60).toFixed(2) + "Hz")
   }
   function selDisp() { return dispEdit[dispSel] || null }
+  // Scale presets. The fractional entries let panels of different pixel density share the
+  // same PHYSICAL ui size — e.g. a 27" 1440p at 1.33× renders 1920×1080 logical, the same
+  // apparent size as a native 27" 1080p, so the mouse crosses between them seamlessly.
+  // Hyprland snaps each request to the nearest scale that yields whole logical pixels and
+  // reports it back rounded to 2 decimals, which is exactly how these keys are written.
+  readonly property var scalePresets: [
+    { key: "1", name: "1×" }, { key: "1.25", name: "1.25×" }, { key: "1.33", name: "1.33×" },
+    { key: "1.5", name: "1.5×" }, { key: "1.6", name: "1.6×" }, { key: "1.67", name: "1.67×" },
+    { key: "1.75", name: "1.75×" }, { key: "2", name: "2×" }
+  ]
+  // Highlight the preset nearest the live scale (within a hair) so a rounded read-back — or an
+  // odd hand-set scale — still selects sensibly rather than showing blank; fall back to the raw
+  // value when nothing is close, which keeps a genuinely custom scale visible.
+  function scaleKey(s) {
+    var v = Number(s) || 1, best = null, bd = 0.02
+    for (var i = 0; i < scalePresets.length; i++) {
+      var d = Math.abs(parseFloat(scalePresets[i].key) - v)
+      if (d < bd) { bd = d; best = scalePresets[i].key }
+    }
+    return best !== null ? best : String(v)
+  }
   // A hand-written timing for one display, keyed by connector name. Only ever offered
   // for a display that publishes no EDID — the daemon ignores such a pin the moment
   // that port carries a display which CAN identify itself, since a connector name does
@@ -353,9 +374,9 @@ ColumnLayout {
               onSelected: (key) => root.setDisp("mode", key)
             }
             NComboBox {
-              label: "Scale"; minimumWidth: 100
-              model: [{ key: "1", name: "1×" }, { key: "1.25", name: "1.25×" }, { key: "1.5", name: "1.5×" }, { key: "1.6", name: "1.6×" }, { key: "2", name: "2×" }]
-              currentKey: (root.dispRev, String(root.selDisp() ? root.selDisp().scale : 1))
+              label: "Scale"; minimumWidth: 110
+              model: root.scalePresets
+              currentKey: (root.dispRev, root.scaleKey(root.selDisp() ? root.selDisp().scale : 1))
               onSelected: (key) => root.setDisp("scale", parseFloat(key))
             }
             NComboBox {
