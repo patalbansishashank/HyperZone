@@ -92,6 +92,8 @@ ColumnLayout {
     { title: "Close window", desc: "Close asks the window to close — an app that lives in the tray (Discord, Steam) just hides and keeps running. Force kill SIGKILLs the process instead: no save prompt, no cleanup, and it takes EVERY window that process owns (all Chromium profile windows share one process; so do all Unreal Editor panels)",
       items: [{ id: "close-window", label: "Close window" },
               { id: "kill-window", label: "Force kill app (no save!)" }] },
+    { title: "Find my cursor", desc: "Lost the pointer across all these screens? This balloons it for a moment AND pulses a bright white border around the focused window, so you can spot both at a glance",
+      items: [{ id: "locate-cursor", label: "Find cursor + highlight window" }] },
     { title: "Actions", desc: "Re-tile re-snaps windows into their zones · Rearrange is a hard reset that also reclaims floated windows",
       items: [{ id: "toggle-float", label: "Toggle float" }, { id: "rearrange", label: "Rearrange all" },
               { id: "retile", label: "Re-tile / re-snap" }] },
@@ -108,7 +110,8 @@ ColumnLayout {
     "swap-left": ["SUPER + ALT + left"], "swap-right": ["SUPER + ALT + right"],
     "swap-up": ["SUPER + ALT + up"], "swap-down": ["SUPER + ALT + down"],
     "toggle-float": ["SUPER + T"], "rearrange": ["SUPER + SHIFT + T"], "retile": ["SUPER + SHIFT + R"],
-    "close-window": ["SUPER + Q"], "kill-window": ["SUPER + SHIFT + Q"]
+    "close-window": ["SUPER + Q"], "kill-window": ["SUPER + SHIFT + Q"],
+    "locate-cursor": ["SUPER + backslash"]
   })
   function combosOf(id) { var k = edit.keybinds || {}; return (k[id] || []).slice() }
   function setCombos(id, arr) {

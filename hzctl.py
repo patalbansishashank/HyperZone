@@ -21,7 +21,7 @@ SOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hyperzone.sock")
 # fixed vocabulary only: the message below is hand-built (no json import for
 # startup speed), which is safe exactly because these are the only values.
 COMMANDS = ("focus", "move", "tomon", "push", "swap", "toggle-float", "snap-drop",
-            "float-drop", "retile", "rearrange", "dump")
+            "float-drop", "retile", "rearrange", "dump", "locate")
 ARGS = (None, "left", "right", "up", "down")
 
 

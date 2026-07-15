@@ -6,6 +6,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Wayland
 import qs.Commons
 import qs.Services.UI
 
@@ -117,9 +118,73 @@ Item {
       ToastService.showNotice("HyperZone",
         "Display layout reverted" + (data.reason === "timeout" ? " (not confirmed in time)" : ""))
       break
+    case "locate":
+      root._showLocate(data)   // find-my-cursor: pulse a border around the active window
+      break
     case "error":
       ToastService.showError("HyperZone", data.message || "error")
       break
+    }
+  }
+
+  // ---- find-my-cursor: transient pulsing border overlay ----
+  // The daemon balloons the pointer itself (hyprctl setcursor) and emits `locate`
+  // with the focused window's rect in monitor-LOCAL logical px. We draw a bright,
+  // sine-pulsing border on a click-through overlay over that monitor, then vanish.
+  // (Hyprland's own border colour can't be recoloured at runtime on this build, so
+  // we render our own — full control over the fade.)
+  property var _locate: null
+  property var _locateScreen: null
+  property bool _locateOn: false
+
+  function _showLocate(d) {
+    if (!d || d.w <= 0 || d.h <= 0) return
+    // resolve the target monitor in JS up-front — binding `visible` to `screen`
+    // fights PanelWindow's own screen management and loops.
+    var scr = Quickshell.screens.find(s => s.name === d.monitor) || null
+    if (!scr) return
+    root._locate = d
+    root._locateScreen = scr
+    root._locateOn = true
+    _locateTimer.interval = Math.max(300, d.duration_ms || 1500)
+    _locateTimer.restart()
+  }
+
+  Timer { id: _locateTimer; onTriggered: root._locateOn = false }
+
+  // Always declared, shown only during a locate. `screen`/`visible` bind to plain
+  // properties (not to each other) so there's no binding loop; visible:false tears
+  // the surface down between uses.
+  PanelWindow {
+    id: locateOvl
+    readonly property var d: root._locate || ({})
+    screen: root._locateScreen
+    visible: root._locateOn
+    color: "transparent"
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.namespace: "hyperzone-locate"
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+    WlrLayershell.exclusionMode: ExclusionMode.Ignore
+    anchors { top: true; bottom: true; left: true; right: true }
+    mask: Region {}   // fully click-through — draw only, never grab input
+
+    Rectangle {
+      x: locateOvl.d.x || 0
+      y: locateOvl.d.y || 0
+      width: locateOvl.d.w || 0
+      height: locateOvl.d.h || 0
+      color: "transparent"
+      radius: 10
+      antialiasing: true
+      border.width: locateOvl.d.border || 6
+      border.color: locateOvl.d.color || "#ffffff"
+      // fade in/out on a sine — two InOutSine half-cycles ping-ponged while visible
+      SequentialAnimation on opacity {
+        running: locateOvl.visible
+        loops: Animation.Infinite
+        NumberAnimation { from: 0.15; to: 1.0; duration: 450; easing.type: Easing.InOutSine }
+        NumberAnimation { from: 1.0; to: 0.15; duration: 450; easing.type: Easing.InOutSine }
+      }
     }
   }
 
