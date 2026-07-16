@@ -83,12 +83,22 @@ ColumnLayout {
     { title: "Send to monitor", desc: "Throw the window to the screen in that direction",
       items: [{ id: "tomon-left", label: "To monitor ← left" }, { id: "tomon-right", label: "To monitor → right" },
               { id: "tomon-up", label: "To monitor ↑ up" }, { id: "tomon-down", label: "To monitor ↓ down" }] },
+    { title: "Send to workspace", desc: "Throw the focused window to another workspace — the third axis of moving a window, alongside zones and monitors. Workspaces 1 and 10 also answer to Super+Ctrl+Home/End. (Switching which workspace you're LOOKING at stays with Hyprland: Super+1…0)",
+      items: [{ id: "tows-1", label: "To workspace 1" }, { id: "tows-2", label: "To workspace 2" },
+              { id: "tows-3", label: "To workspace 3" }, { id: "tows-4", label: "To workspace 4" },
+              { id: "tows-5", label: "To workspace 5" }, { id: "tows-6", label: "To workspace 6" },
+              { id: "tows-7", label: "To workspace 7" }, { id: "tows-8", label: "To workspace 8" },
+              { id: "tows-9", label: "To workspace 9" }, { id: "tows-10", label: "To workspace 10" },
+              { id: "tows-special", label: "To special (magic)" }] },
     { title: "Move across everything", desc: "Rearrange in-screen, then spill to the next monitor at the edge",
       items: [{ id: "push-left", label: "Push left" }, { id: "push-right", label: "Push right" },
               { id: "push-up", label: "Push up" }, { id: "push-down", label: "Push down" }] },
     { title: "Swap window", desc: "Trade places with the window in that direction — works across screens too. Focus follows the AREA: the window that arrives where you were working takes focus, so you keep looking at the same spot",
       items: [{ id: "swap-left", label: "Swap ← left" }, { id: "swap-right", label: "Swap → right" },
               { id: "swap-up", label: "Swap ↑ up" }, { id: "swap-down", label: "Swap ↓ down" }] },
+    { title: "Window state", desc: "Fullscreen the focused window · Group tabs the windows in a zone together, so they stack as tabs instead of splitting the space",
+      items: [{ id: "fullscreen", label: "Toggle fullscreen" },
+              { id: "toggle-group", label: "Toggle group / tabs" }] },
     { title: "Close window", desc: "Close asks the window to close — an app that lives in the tray (Discord, Steam) just hides and keeps running. Force kill SIGKILLs the process instead: no save prompt, no cleanup, and it takes EVERY window that process owns (all Chromium profile windows share one process; so do all Unreal Editor panels)",
       items: [{ id: "close-window", label: "Close window" },
               { id: "kill-window", label: "Force kill app (no save!)" }] },
@@ -111,7 +121,14 @@ ColumnLayout {
     "swap-up": ["SUPER + ALT + up"], "swap-down": ["SUPER + ALT + down"],
     "toggle-float": ["SUPER + T"], "rearrange": ["SUPER + SHIFT + T"], "retile": ["SUPER + SHIFT + R"],
     "close-window": ["SUPER + Q"], "kill-window": ["SUPER + SHIFT + Q"],
-    "locate-cursor": ["SUPER + A"]
+    "locate-cursor": ["SUPER + A"],
+    "fullscreen": ["SUPER + F"], "toggle-group": ["SUPER + W"],
+    "tows-1": ["SUPER + SHIFT + 1", "SUPER + CTRL + Home"], "tows-2": ["SUPER + SHIFT + 2"],
+    "tows-3": ["SUPER + SHIFT + 3"], "tows-4": ["SUPER + SHIFT + 4"],
+    "tows-5": ["SUPER + SHIFT + 5"], "tows-6": ["SUPER + SHIFT + 6"],
+    "tows-7": ["SUPER + SHIFT + 7"], "tows-8": ["SUPER + SHIFT + 8"],
+    "tows-9": ["SUPER + SHIFT + 9"], "tows-10": ["SUPER + SHIFT + 0", "SUPER + CTRL + End"],
+    "tows-special": ["SUPER + SHIFT + S"]
   })
   function combosOf(id) { var k = edit.keybinds || {}; return (k[id] || []).slice() }
   function setCombos(id, arr) {

@@ -213,10 +213,21 @@ KEYBIND_CMDS = {
 #   kill  = SIGKILL the PROCESS behind it — per-PROCESS, so EVERY window that process
 #           owns dies too (all Chromium profile windows share one browser process; all
 #           Unreal Editor panels share the editor's). No save prompt, no cleanup.
+#   fullscreen / toggle-group = window STATE, and tows-* = "send this window to
+#           workspace N" — the third axis of moving a window (zone -> monitor ->
+#           workspace), so they belong next to move-*/tomon-* rather than being
+#           hand-written in hyprland.lua. (dwindle's `pseudo` and `togglesplit` are
+#           deliberately NOT taken over: they're layout knobs this tiler overrides on
+#           every monitor it manages, so owning them would advertise a dead setting.)
 KEYBIND_LUA = {
     "close-window": "hl.dsp.window.close()",
     "kill-window": "hl.dsp.window.kill()",
+    "fullscreen": "hl.dsp.window.fullscreen()",
+    "toggle-group": 'hl.dsp.exec_cmd("hyprctl dispatch togglegroup")',
+    "tows-special": 'hl.dsp.window.move({ workspace = "special:magic" })',
 }
+for _i in range(1, 11):      # send the window to workspace 1..10
+    KEYBIND_LUA["tows-%d" % _i] = "hl.dsp.window.move({ workspace = %d })" % _i
 KEYBIND_ACTIONS = set(KEYBIND_CMDS) | set(KEYBIND_LUA)
 DEFAULT_KEYBINDS = {
     "focus-left": ["SUPER + left", "SUPER + H"],
@@ -245,7 +256,19 @@ DEFAULT_KEYBINDS = {
     "close-window": ["SUPER + Q"],
     "kill-window": ["SUPER + SHIFT + Q"],
     "locate-cursor": ["SUPER + A"],
+    "fullscreen": ["SUPER + F"],
+    "toggle-group": ["SUPER + W"],
+    "tows-special": ["SUPER + SHIFT + S"],
 }
+# Send-to-workspace defaults reproduce hyprland.lua's loop: workspace i on SUPER+SHIFT+
+# (i % 10), so ws10 is the "0" key. Workspaces 1 and 10 keep their CTRL+Home/End aliases.
+for _i in range(1, 11):
+    _combos = ["SUPER + SHIFT + %d" % (_i % 10)]
+    if _i == 1:
+        _combos.append("SUPER + CTRL + Home")
+    elif _i == 10:
+        _combos.append("SUPER + CTRL + End")
+    DEFAULT_KEYBINDS["tows-%d" % _i] = _combos
 # "find my cursor" / screen-share pointer. On the hotkey the plugin overlay draws a
 # sleek arrow that points AT the cursor and FOLLOWS it live. The daemon owns the live
 # part: it polls `cursorpos` (a cheap .socket.sock round-trip) every LOCATE_POLL_S and
@@ -2292,6 +2315,13 @@ class Daemon(HyperZone):
             m = re.search(r'hyperzone\s*\.\.\s*"\s*([a-z-]+)', s)
             return bool(m) and m.group(1) in _KB_VERBS
         if "hl.dsp.window.close(" in s or "hl.dsp.window.kill(" in s:
+            return True
+        if "hl.dsp.window.fullscreen(" in s or "togglegroup" in s:
+            return True
+        # send-to-workspace: window.move({workspace=..}) — the DIRECTIONAL window.move
+        # binds say direction=, and the workspace-FOCUS binds are hl.dsp.focus, so
+        # neither is caught here.
+        if "hl.dsp.window.move(" in s and "workspace" in s:
             return True
         return "hl.dsp.focus(" in s and "direction" in s
 
