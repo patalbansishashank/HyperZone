@@ -200,9 +200,10 @@ KEYBIND_CMDS = {
     "swap-left": "swap left", "swap-right": "swap right",
     "swap-up": "swap up", "swap-down": "swap down",
     "toggle-float": "toggle-float", "rearrange": "rearrange", "retile": "retile",
-    # "find my cursor": balloon the pointer AND pulse the focused window's border.
-    # Runs in the daemon (setcursor + a border-overlay event to the plugin), so it
-    # goes through hzctl like the tiling verbs rather than a bare dispatcher.
+    # "find my cursor": draw a pulsing spotlight ring at the pointer AND a bright border
+    # around the window under it. Runs in the daemon (it resolves the cursor's monitor +
+    # the window under the cursor, then emits one overlay event), so it goes through hzctl
+    # like the tiling verbs rather than a bare dispatcher.
     "locate-cursor": "locate",
 }
 # Actions bound STRAIGHT to a Hyprland dispatcher instead of round-tripping through
@@ -243,16 +244,20 @@ DEFAULT_KEYBINDS = {
     "retile": ["SUPER + SHIFT + R"],
     "close-window": ["SUPER + Q"],
     "kill-window": ["SUPER + SHIFT + Q"],
-    "locate-cursor": ["SUPER + backslash"],
+    "locate-cursor": ["SUPER + A"],
 }
-# "find my cursor" tunables. The balloon grows the pointer for a beat; the border
-# pulse is drawn by the plugin overlay (Hyprland's own border colour can't be set at
-# runtime on the non-legacy Lua build — hyprctl keyword/setprop are both refused).
-LOCATE_GROW_S = 0.8            # how long the pointer stays ballooned
-LOCATE_CURSOR_MULT = 3        # ballooned size = base cursor size × this (min 64)
-LOCATE_BORDER_MS = 1600       # how long the window border pulses (plugin-side)
-LOCATE_BORDER_COLOR = "#ffffff"
-LOCATE_BORDER_PX = 6
+# "find my cursor" / screen-share pointer. On the hotkey the plugin overlay draws a
+# sleek arrow that points AT the cursor and FOLLOWS it live. The daemon owns the live
+# part: it polls `cursorpos` (a cheap .socket.sock round-trip) every LOCATE_POLL_S and
+# streams position frames to the overlay, keeping the arrow up until the cursor has been
+# still for LOCATE_HOLD_S, then telling it to fade. The arrow is DRAWN by us — Hyprland
+# offers no reliable runtime hook (setcursor repaints late/never).
+LOCATE_ARROW_PX = 130         # length of the pointer arrow (logical px)
+LOCATE_HOLD_S = 1.4           # keep showing this long after the cursor last moved, then fade
+LOCATE_POLL_S = 0.03          # cursor re-sample cadence while the arrow is up (~33 Hz)
+LOCATE_MAX_S = 30.0           # hard cap on a single activation (jitter safety)
+LOCATE_MOVE_EPS = 2           # px of motion that counts as "still moving" (refreshes the hold)
+LOCATE_ARROW_COLOR = "#ffffff"        # arrow tint (drawn by the plugin overlay)
 KEYBINDS = {k: list(v) for k, v in DEFAULT_KEYBINDS.items()}
 KEYBIND_MARKER = "-- hyperzone-managed keybinds"
 # verbs whose hand-written hyprland.lua binds we take over (mouse drag-binds
@@ -927,35 +932,6 @@ def hbatch(exprs):
                            capture_output=True, text=True, timeout=2)
         except Exception as e2:
             log("hbatch error", e2)
-
-
-_CURSOR_TS = None
-def cursor_theme_size():
-    """(theme, size) for the pointer, so `locate` can balloon and restore it.
-    The daemon is spawned by Noctalia and does NOT inherit XCURSOR_* in its env, so
-    fall back to parsing hyprland.lua's `hl.env("XCURSOR_THEME"/"XCURSOR_SIZE", ...)`.
-    Cached once per process. theme is None if it can't be determined (skip the balloon)."""
-    global _CURSOR_TS
-    if _CURSOR_TS is not None:
-        return _CURSOR_TS
-    theme = os.environ.get("XCURSOR_THEME") or os.environ.get("HYPRCURSOR_THEME")
-    try:
-        size = int(os.environ.get("XCURSOR_SIZE") or os.environ.get("HYPRCURSOR_SIZE") or 0)
-    except ValueError:
-        size = 0
-    if not theme or not size:
-        try:
-            txt = open(HYPRLAND_LUA, encoding="utf-8", errors="replace").read()
-            if not theme:
-                m = re.search(r'hl\.env\(\s*"(?:X|HYPR)CURSOR_THEME"\s*,\s*"([^"]+)"', txt)
-                theme = m.group(1) if m else theme
-            if not size:
-                m = re.search(r'hl\.env\(\s*"(?:X|HYPR)CURSOR_SIZE"\s*,\s*"?(\d+)', txt)
-                size = int(m.group(1)) if m else size
-        except OSError as e:
-            log("cursor theme parse failed", e)
-    _CURSOR_TS = (theme, size or 24)
-    return _CURSOR_TS
 
 
 def naddr(a):
@@ -1953,8 +1929,10 @@ class Daemon(HyperZone):
         self.layout_revert_at = None    # deadline to auto-revert a pending display layout
         self.layout_prev_specs = None   # live specs snapshotted before an apply (for exact revert)
         self.monitors_refresh_at = None # deadline for a deferred (settled) monitors_changed push
-        self.cursor_restore_at = None   # deadline to shrink a `locate`-ballooned pointer back
-        self.cursor_restore_spec = None # (theme, size) to restore the pointer to
+        self.locate_until = None        # while > now, the cursor arrow is up and we poll cursorpos
+        self.locate_deadline = None     # hard cap on one activation (LOCATE_MAX_S)
+        self.locate_last = None         # last global cursor (x, y) seen, to detect movement
+        self.locate_mon = None          # last monitor id emitted (to detect a monitor crossing)
         self.capture_resume_at = None   # while set, our keybinds are suspended so the UI can
                                         # record a chord Hyprland would otherwise grab; a deadline
                                         # backstop re-registers them if the UI never resumes
@@ -2670,14 +2648,13 @@ class Daemon(HyperZone):
         if self.verify_at is not None and now >= self.verify_at:
             self.verify_at = None
             self.run_verify()
-        if self.cursor_restore_at is not None and now >= self.cursor_restore_at:
-            self.cursor_restore_at = None
-            if self.cursor_restore_spec:
-                theme, size = self.cursor_restore_spec
-                try:
-                    hypr_request("setcursor %s %d" % (theme, size))
-                except OSError as e:
-                    log("locate: cursor restore failed", e)
+        if self.locate_until is not None:
+            if now >= self.locate_until or (self.locate_deadline and now >= self.locate_deadline):
+                self.locate_until = None           # cursor idle long enough (or capped) -> fade
+                self.locate_deadline = None
+                self.emit("locate_end", {})
+            else:
+                self._locate_frame(start=False)    # stream the next cursor position
         if self.layout_revert_at is not None and now >= self.layout_revert_at:
             self.revert_layout("timeout")   # nobody confirmed -> auto-restore
         if self.monitors_refresh_at is not None and now >= self.monitors_refresh_at:
@@ -2707,8 +2684,8 @@ class Daemon(HyperZone):
             deadlines.append(self.layout_revert_at)
         if self.monitors_refresh_at is not None:
             deadlines.append(self.monitors_refresh_at)
-        if self.cursor_restore_at is not None:
-            deadlines.append(self.cursor_restore_at)
+        if self.locate_until is not None:
+            deadlines.append(time.time() + LOCATE_POLL_S)   # keep sampling the cursor
         if self.capture_resume_at is not None:
             deadlines.append(self.capture_resume_at)
         if not deadlines:
@@ -3413,39 +3390,53 @@ class Daemon(HyperZone):
             self._focus_window(tgt, cross=True)   # coming from an empty screen
 
     def cmd_locate(self, active=""):
-        """Find-my-cursor across many monitors: balloon the pointer for a beat, and
-        tell the plugin overlay to pulse a bright border around the focused window so
-        it's obvious which one — and where — is active. The border pulse is a no-op
-        when headless (emit only does anything in stdio/plugin mode)."""
-        # 1) balloon the pointer; tick() shrinks it back after LOCATE_GROW_S
-        theme, base = cursor_theme_size()
-        if theme:
-            big = max(int(base * LOCATE_CURSOR_MULT), 64)
-            try:
-                hypr_request("setcursor %s %d" % (theme, big))
-                self.cursor_restore_spec = (theme, base)
-                self.cursor_restore_at = time.time() + LOCATE_GROW_S
-            except OSError as e:
-                log("locate: setcursor failed", e)
-        # 2) pulse the focused window's border. at/size are GLOBAL LOGICAL px, same
-        # space as the monitor's logical x/y — so (at - mon.xy) is the rect in the
-        # monitor-local logical coords the plugin's per-screen overlay draws in.
-        aw = hjson("activewindow")
-        if not (aw and aw.get("at") and aw.get("size")):
-            return                                 # focus on an empty screen -> pointer only
-        at, sz = aw["at"], aw["size"]
-        mon = next((m for m in self.monitors_cached() if m.get("id") == aw.get("monitor")), None)
+        """Find-my-cursor / screen-share pointer: start the live arrow. Arm the tracker
+        and emit the first frame; tick() then streams cursor frames (see _locate_frame)
+        until the pointer has been still for LOCATE_HOLD_S, at which point it emits
+        `locate_end` and the overlay fades. No-op when headless (emit is a no-op outside
+        stdio/plugin mode). Pressing again while it's up just re-arms it."""
+        now = time.time()
+        self.locate_deadline = now + LOCATE_MAX_S
+        self.locate_last = None      # force the first frame to count as movement
+        self.locate_mon = None
+        self._locate_frame(start=True)
+
+    def _locate_frame(self, start=False):
+        """Sample the cursor and push one overlay frame (the arrow). cursorpos and monitor
+        x/y are global-logical px, so monitor-local = (point - monitor.xy). On `start` emit
+        `locate` (carries the static config); otherwise emit `locate_move` only when the
+        cursor moved. Movement refreshes locate_until so it lives while pointing, then fades."""
+        pos = hjson("cursorpos") or {}
+        cx, cy = pos.get("x"), pos.get("y")
+        if cx is None or cy is None:
+            return
+        mon = None
+        for m in self.monitors_cached():
+            mx, my, mw, mh = logical_rect(m)
+            if mx <= cx < mx + mw and my <= cy < my + mh:
+                mon = m
+                break
         if not mon:
             return
-        self.emit("locate", {
-            "monitor": mon.get("name"),
-            "x": at[0] - mon.get("x", 0),
-            "y": at[1] - mon.get("y", 0),
-            "w": sz[0], "h": sz[1],
-            "color": LOCATE_BORDER_COLOR,
-            "duration_ms": LOCATE_BORDER_MS,
-            "border": LOCATE_BORDER_PX,
-        })
+        mx, my, _, _ = logical_rect(mon)
+        now = time.time()
+        moved = (self.locate_last is None
+                 or abs(cx - self.locate_last[0]) >= LOCATE_MOVE_EPS
+                 or abs(cy - self.locate_last[1]) >= LOCATE_MOVE_EPS)
+        mon_changed = self.locate_mon != mon.get("id")
+        if moved or self.locate_until is None:
+            self.locate_until = now + LOCATE_HOLD_S     # keep alive while pointing
+        if not start and not moved and not mon_changed:
+            return                                      # nothing new -> stay quiet
+        self.locate_last = (cx, cy)
+        self.locate_mon = mon.get("id")
+        data = {"monitor": mon.get("name"), "cx": cx - mx, "cy": cy - my}
+        if start:
+            data.update({"arrow": LOCATE_ARROW_PX, "color": LOCATE_ARROW_COLOR,
+                         "hold_ms": int(LOCATE_HOLD_S * 1000)})
+            self.emit("locate", data)
+        else:
+            self.emit("locate_move", data)
 
     def _focusable_windows(self):
         """Mapped windows currently visible (on each monitor's active workspace)."""

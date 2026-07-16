@@ -119,7 +119,13 @@ Item {
         "Display layout reverted" + (data.reason === "timeout" ? " (not confirmed in time)" : ""))
       break
     case "locate":
-      root._showLocate(data)   // find-my-cursor: pulse a border around the active window
+      root._startLocate(data)  // find-my-cursor / screen-share pointer: arrow appears
+      break
+    case "locate_move":
+      root._moveLocate(data)   // live cursor frame — arrow (+ border) follow
+      break
+    case "locate_end":
+      root._endLocate()        // cursor idle -> fade out
       break
     case "error":
       ToastService.showError("HyperZone", data.message || "error")
@@ -127,37 +133,79 @@ Item {
     }
   }
 
-  // ---- find-my-cursor: transient pulsing border overlay ----
-  // The daemon balloons the pointer itself (hyprctl setcursor) and emits `locate`
-  // with the focused window's rect in monitor-LOCAL logical px. We draw a bright,
-  // sine-pulsing border on a click-through overlay over that monitor, then vanish.
-  // (Hyprland's own border colour can't be recoloured at runtime on this build, so
-  // we render our own — full control over the fade.)
-  property var _locate: null
+  // ---- find-my-cursor / screen-share pointer ----
+  // The daemon streams frames (monitor-LOCAL logical px): `locate` (start, carries config),
+  // `locate_move` (a new cursor position), and `locate_end` (cursor idle -> fade). We DRAW
+  // a sleek arrow that points AT the cursor and follows it live on a click-through overlay.
+  // `_cfg` holds the static config from `start`; `_geo` is the latest frame; a shared
+  // `_pulse * _fade` drives the arrow's blink and fade-in/out.
+  property var _cfg: ({})
+  property var _geo: ({})
   property var _locateScreen: null
   property bool _locateOn: false
+  property real _pulse: 1.0                 // gentle sine blink while active
+  property real _fade: 0.0                   // 0 hidden, 1 shown; Behavior animates it
+  Behavior on _fade { NumberAnimation { duration: 300; easing.type: Easing.OutQuad } }
+  readonly property real _op: _pulse * _fade
 
-  function _showLocate(d) {
-    if (!d || d.w <= 0 || d.h <= 0) return
+  // convenience geometry for the arrow (monitor-local logical px)
+  readonly property real _cx: (_geo.cx || 0)
+  readonly property real _cy: (_geo.cy || 0)
+  readonly property real _alen: (_cfg.arrow || 130)
+  readonly property real _sw: _locateScreen ? _locateScreen.width : 1920
+  readonly property real _sh: _locateScreen ? _locateScreen.height : 1080
+  // pick the approach side so the arrow BODY stays on-screen: come from the top-left
+  // (point down-right) by default; flip toward whichever edge has room near a border.
+  readonly property real _reach: _alen * 0.72
+  readonly property int _sx: (_cx - _reach >= 24) ? 1 : -1
+  readonly property int _sy: (_cy - _reach >= 24) ? 1 : -1
+  readonly property real _angle: Math.atan2(_sy, _sx) * 180 / Math.PI
+
+  function _startLocate(d) {
+    if (!d || d.cx === undefined) return
     // resolve the target monitor in JS up-front — binding `visible` to `screen`
     // fights PanelWindow's own screen management and loops.
     var scr = Quickshell.screens.find(s => s.name === d.monitor) || null
     if (!scr) return
-    root._locate = d
+    root._cfg = d
+    root._geo = d
     root._locateScreen = scr
     root._locateOn = true
-    _locateTimer.interval = Math.max(300, d.duration_ms || 1500)
-    _locateTimer.restart()
+    root._fade = 1.0
+    _locateEnd.stop()
+    _locateSafety.interval = (d.hold_ms || 1400) + 9000   // hide if `locate_end` never comes
+    _locateSafety.restart()
+  }
+  function _moveLocate(d) {
+    if (!root._locateOn || !d || d.cx === undefined) return
+    if (d.monitor !== (root._geo.monitor || "")) {
+      var scr = Quickshell.screens.find(s => s.name === d.monitor) || null
+      if (scr) root._locateScreen = scr
+    }
+    root._geo = d
+    _locateSafety.restart()
+  }
+  function _endLocate() {
+    root._fade = 0.0
+    _locateEnd.restart()          // hide once the fade finishes
   }
 
-  Timer { id: _locateTimer; onTriggered: root._locateOn = false }
+  Timer { id: _locateEnd; interval: 340; onTriggered: root._locateOn = false }
+  Timer { id: _locateSafety; onTriggered: root._endLocate() }
+
+  // gentle blink while active; multiplied by _fade for the fade-in/out
+  SequentialAnimation on _pulse {
+    running: root._locateOn
+    loops: Animation.Infinite
+    NumberAnimation { from: 1.0; to: 0.62; duration: 520; easing.type: Easing.InOutSine }
+    NumberAnimation { from: 0.62; to: 1.0; duration: 520; easing.type: Easing.InOutSine }
+  }
 
   // Always declared, shown only during a locate. `screen`/`visible` bind to plain
   // properties (not to each other) so there's no binding loop; visible:false tears
   // the surface down between uses.
   PanelWindow {
     id: locateOvl
-    readonly property var d: root._locate || ({})
     screen: root._locateScreen
     visible: root._locateOn
     color: "transparent"
@@ -168,22 +216,51 @@ Item {
     anchors { top: true; bottom: true; left: true; right: true }
     mask: Region {}   // fully click-through — draw only, never grab input
 
-    Rectangle {
-      x: locateOvl.d.x || 0
-      y: locateOvl.d.y || 0
-      width: locateOvl.d.w || 0
-      height: locateOvl.d.h || 0
-      color: "transparent"
-      radius: 10
-      antialiasing: true
-      border.width: locateOvl.d.border || 6
-      border.color: locateOvl.d.color || "#ffffff"
-      // fade in/out on a sine — two InOutSine half-cycles ping-ponged while visible
-      SequentialAnimation on opacity {
-        running: locateOvl.visible
-        loops: Animation.Infinite
-        NumberAnimation { from: 0.15; to: 1.0; duration: 450; easing.type: Easing.InOutSine }
-        NumberAnimation { from: 1.0; to: 0.15; duration: 450; easing.type: Easing.InOutSine }
+    // This overlay only draws the arrow (no window highlight).
+
+    // the pointer arrow: drawn once (Canvas) pointing right with its tip at Item.Right,
+    // then rotated to `_angle` and positioned so the tip sits on the cursor. Behaviors
+    // on x/y/rotation smooth the daemon's discrete ~33 Hz frames into fluid motion.
+    Item {
+      id: arrow
+      visible: root._geo.cx !== undefined
+      width: root._alen
+      height: 56
+      transformOrigin: Item.Right                 // pivot = the tip, stays on the cursor
+      x: root._cx - width
+      y: root._cy - height / 2
+      rotation: root._angle
+      opacity: root._op
+      Behavior on x { NumberAnimation { duration: 70; easing.type: Easing.OutQuad } }
+      Behavior on y { NumberAnimation { duration: 70; easing.type: Easing.OutQuad } }
+      Behavior on rotation { NumberAnimation { duration: 130; easing.type: Easing.OutQuad } }
+
+      Canvas {
+        anchors.fill: parent
+        readonly property color tint: root._cfg.color || "#ffffff"
+        onTintChanged: requestPaint()
+        onWidthChanged: requestPaint()
+        onPaint: {
+          var ctx = getContext("2d")
+          ctx.reset()
+          var W = width, H = height, cy = H / 2
+          var headLen = 46, headHalf = 26, shaftH = 16
+          ctx.lineJoin = "round"
+          ctx.beginPath()
+          ctx.moveTo(0, cy - shaftH / 2)                 // shaft top-left
+          ctx.lineTo(W - headLen, cy - shaftH / 2)       // shaft top-right
+          ctx.lineTo(W - headLen, cy - headHalf)         // head top flare
+          ctx.lineTo(W, cy)                              // tip
+          ctx.lineTo(W - headLen, cy + headHalf)         // head bottom flare
+          ctx.lineTo(W - headLen, cy + shaftH / 2)       // shaft bottom-right
+          ctx.lineTo(0, cy + shaftH / 2)                 // shaft bottom-left
+          ctx.closePath()
+          ctx.fillStyle = tint
+          ctx.fill()
+          ctx.lineWidth = 2                              // dark rim -> readable on any bg
+          ctx.strokeStyle = "rgba(0,0,0,0.55)"
+          ctx.stroke()
+        }
       }
     }
   }
