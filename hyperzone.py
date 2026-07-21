@@ -3687,18 +3687,19 @@ class Daemon(HyperZone):
             "last_cur": None, "last_at": None, "travel": 0.0,
         }
         if self.drag["intent"] == "float":
-            self._drag_pull()      # float acts eagerly: pop free the moment it's grabbed
+            self._drag_pull()      # grid windows pop free at the grab; tiles at the drop
         self._paint_intent()
         log("drag-start", addr, kind, "->", self.drag["intent"])
 
-    def _drag_pull(self, mid_drag=False):
-        """Detach the session window: out of the grid on managed screens (safe at
-        any time — the dragged window itself gets no geometry dispatch), floated
-        in place on unmanaged ones. mid_drag defers the native-tile float to the
-        DROP: re-geometrying a tile in the middle of a live drag fights
-        Hyprland's begin-drag reference state and teleports the window to its
-        remembered float rect. At drag START the drag has barely moved, so the
-        eager float lands invisibly."""
+    def _drag_pull(self):
+        """Detach the session window: out of the grid on managed screens — safe at
+        any time, remove() never dispatches geometry to the dragged window itself.
+        NATIVE TILES ARE NEVER FLOATED WHILE THE SESSION LIVES: float-enabling a
+        window Hyprland is actively dragging both teleports it (remembered-float-
+        rect restore beats our in-place pin) and BREAKS THE DRAG GRAB — the drag
+        began in layout mode, the window stops following the cursor (seen in the
+        wild as drag-watch false-firing mid-drag). The tile keeps its layout drag,
+        amber shows the intent, and the DROP floats it in place."""
         d = self.drag
         if not d or d["pulled"]:
             return
@@ -3706,9 +3707,7 @@ class Daemon(HyperZone):
         if mon:
             self.remove(d["addr"], mon)
         elif not (self.client(d["addr"]) or {}).get("floating"):
-            if mid_drag:
-                return                # amber shows the intent; the drop will float it
-            self._float_in_place(d["addr"])
+            return                    # native tile: the drop will float it
         self.detached.add(d["addr"])
         d["pulled"] = True
 
@@ -3745,7 +3744,7 @@ class Daemon(HyperZone):
             d["prev"] = None
         d["intent"] = intent
         if intent == "float":
-            self._drag_pull(mid_drag=True)   # grid pull is eager; native tiles wait
+            self._drag_pull()         # grid pull is eager; native tiles wait for drop
         self._paint_intent()
         log("drag-mod", action, "->", intent)
 
