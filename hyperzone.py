@@ -20,6 +20,7 @@ Run as:
         tomon <left|right|up|down>  # send focused window to the next monitor
         toggle-float                # detach (free float) / re-attach focused window
         snap-drop                   # (on drag release) snap window into cursor's zone
+        float-grab                  # (on drag START) detach; window floats wherever dropped
         float-drop                  # (on drag release) leave window free-floating
         retile                      # re-adopt & relayout tracked windows
         rearrange                   # hard reset: re-tile EVERY window on the screen
@@ -129,6 +130,10 @@ DENY_PLACE_MAX_TRIES = 12    # …until it stops changing (settled) or this many
 FS_INSIST_WINDOW = 1.5       # re-fullscreen within this = app insists; stop fighting
 MON_CACHE_TTL = 1.0          # monitors-list micro-cache (also event-invalidated)
 CROSS_PLACE_TIMEOUT = 2.0    # honour a cross-monitor move's aligned-zone intent this long
+FLOAT_GUARD_S = 15.0         # after a float-grab, swallow one snap-drop for that window
+                             # this long (covers the longest plausible drag): releasing
+                             # CTRL a beat before the button makes the SUPER-only release
+                             # bind fire snap-drop at the end of a FLOAT drag
 CAPTURE_MODE_TIMEOUT = 20.0  # auto-restore binds if the UI's key-capture never resumes them
 
 
@@ -1257,6 +1262,11 @@ class HyperZone:
     def __init__(self):
         self.mons = {}              # name -> Monitor
         self.detached = set()       # addrs the user popped to free-float (ignored)
+        self.float_guard = {}       # addr -> deadline: float-grab detached it at drag
+                                    # START; if CTRL is released before the button, the
+                                    # button-release matches the SUPER-only bind and
+                                    # fires snap-drop — swallow that one so it can't
+                                    # re-capture the window the user just freed
         self.suspended = {}         # addr -> (mon, zone) saved while fullscreen
         self.dirty = set()          # monitor names needing a geometry flush
         self.reconcile_needed = False   # a fullscreen event arrived; reconcile once
@@ -1715,6 +1725,7 @@ class HyperZone:
         self.detached &= valid
         self.painted &= valid
         self.was_managed &= valid
+        self.float_guard = {a: d for a, d in self.float_guard.items() if a in valid}
 
     def remove(self, addr, mon=None):
         """Free addr's spot. Its sibling collapses up to reclaim the space; other
@@ -3009,6 +3020,8 @@ class Daemon(HyperZone):
         elif cmd == "snap-drop" and active:
             self.cmd_snap_drop(active)     # dropped on managed -> snap to cursor zone
             self.verify_at = time.time() + VERIFY_AFTER_CMD
+        elif cmd == "float-grab" and active:
+            self.cmd_float_grab(active)     # float-modifier drag STARTED -> detach now
         elif cmd == "float-drop" and active:
             self.cmd_float_drop(active)     # dropped with float modifier -> leave loose
 
@@ -3557,6 +3570,9 @@ class Daemon(HyperZone):
         under the cursor — adopt it if it came from elsewhere, or move it if it was
         already managed. Occupied tile -> subdivide (on the cursor's side); empty
         zone -> take it whole; anywhere else -> fall back to fill order."""
+        deadline = self.float_guard.pop(addr, None)
+        if deadline and time.time() < deadline:
+            return    # mod-release slip at the end of a FLOAT drag -> window stays free
         c = self.client(addr)
         mon = self.managed_monitor_for(c)
         if not mon:
@@ -3584,9 +3600,28 @@ class Daemon(HyperZone):
             self.place(addr, mon)
         self.apply(mon)
 
+    def cmd_float_grab(self, addr):
+        """A float-modifier drag STARTED on this window: detach it right away.
+        Floating needs no drop position — the drag itself leaves the window wherever
+        the user lets go — so acting at grab time makes the gesture immune to the
+        order the keys are released in (the release bind only fires if BOTH mods are
+        still held at button-up). Arm float_guard so the snap-drop that fires when
+        CTRL slips out early can't re-capture the window (see cmd_snap_drop)."""
+        mon = self.mon_of_addr(addr)
+        if mon:
+            self.remove(addr, mon)
+        self.detached.add(addr)
+        self.float_guard[addr] = time.time() + FLOAT_GUARD_S
+        self.paint(addr, True)        # amber from the moment it's grabbed
+        self.save()
+
     def cmd_float_drop(self, addr):
-        """A window was dropped with the float modifier: leave it free-floating
-        where it landed. Detach it from the grid."""
+        """A window was dropped with the float modifier still held: leave it
+        free-floating where it landed. After a float-grab this is just the clean
+        end of the gesture — disarm the guard so a LATER deliberate snap-drop of
+        the same window isn't swallowed. It still detaches for real when the drag
+        began as a SUPER-only snap drag and CTRL was added mid-drag."""
+        self.float_guard.pop(addr, None)
         mon = self.mon_of_addr(addr)
         if mon:
             self.remove(addr, mon)
@@ -3784,7 +3819,7 @@ def cli_fallback(cmd, arg):
 
 
 COMMANDS = ("daemon", "focus", "move", "tomon", "push", "swap", "toggle-float",
-            "snap-drop", "float-drop", "retile", "rearrange", "dump")
+            "snap-drop", "float-grab", "float-drop", "retile", "rearrange", "dump")
 
 
 def main():
