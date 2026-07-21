@@ -19,9 +19,11 @@ Run as:
         move <left|right|up|down>   # move focused window within its screen
         tomon <left|right|up|down>  # send focused window to the next monitor
         toggle-float                # detach (free float) / re-attach focused window
-        snap-drop                   # (on drag release) snap window into cursor's zone
-        float-grab                  # (on drag START) detach; window floats wherever dropped
-        float-drop                  # (on drag release) leave window free-floating
+        drag-start <snap|float|tile|both>   # a Super+drag began with this intent
+        drag-mod <ctrl|shift>-<down|up>     # modifier changed mid-drag -> retarget
+        drag-drop                   # button released -> apply the final intent
+        snap-drop                   # one-shot: snap window into cursor's zone
+        float-drop                  # one-shot: detach window to free-floating
         retile                      # re-adopt & relayout tracked windows
         rearrange                   # hard reset: re-tile EVERY window on the screen
         dump                        # log the current layout state (debugging)
@@ -130,10 +132,14 @@ DENY_PLACE_MAX_TRIES = 12    # …until it stops changing (settled) or this many
 FS_INSIST_WINDOW = 1.5       # re-fullscreen within this = app insists; stop fighting
 MON_CACHE_TTL = 1.0          # monitors-list micro-cache (also event-invalidated)
 CROSS_PLACE_TIMEOUT = 2.0    # honour a cross-monitor move's aligned-zone intent this long
-FLOAT_GUARD_S = 15.0         # after a float-grab, swallow one snap-drop for that window
-                             # this long (covers the longest plausible drag): releasing
-                             # CTRL a beat before the button makes the SUPER-only release
-                             # bind fire snap-drop at the end of a FLOAT drag
+DRAG_POLL_S = 0.05           # cursor/window sample cadence while a drag session is live
+DRAG_GRACE_S = 0.5           # a modifier released this close to the drop was a slip of
+                             # the fingers, not a change of mind: keep the prior intent
+DRAG_MAX_S = 45.0            # hard cap on a drag session (lost-drop safety)
+DRAG_DIVERGE_PX = 30         # cursor travel with the window standing still that counts
+                             # as "the drag has ended" (fallback drop detection for when
+                             # SUPER is released before the button, so no release bind
+                             # can fire; > Hyprland's edge-snap sticky range)
 CAPTURE_MODE_TIMEOUT = 20.0  # auto-restore binds if the UI's key-capture never resumes them
 
 
@@ -1262,11 +1268,11 @@ class HyperZone:
     def __init__(self):
         self.mons = {}              # name -> Monitor
         self.detached = set()       # addrs the user popped to free-float (ignored)
-        self.float_guard = {}       # addr -> deadline: float-grab detached it at drag
-                                    # START; if CTRL is released before the button, the
-                                    # button-release matches the SUPER-only bind and
-                                    # fires snap-drop — swallow that one so it can't
-                                    # re-capture the window the user just freed
+        self.drag = None            # live drag-session dict (see cmd_drag_start): the
+                                    # drop ACTION is decided by the daemon from tracked
+                                    # modifier state at drop time — switchable mid-drag,
+                                    # border colour = current intent — instead of by
+                                    # which release bind happened to match
         self.suspended = {}         # addr -> (mon, zone) saved while fullscreen
         self.dirty = set()          # monitor names needing a geometry flush
         self.reconcile_needed = False   # a fullscreen event arrived; reconcile once
@@ -1725,7 +1731,8 @@ class HyperZone:
         self.detached &= valid
         self.painted &= valid
         self.was_managed &= valid
-        self.float_guard = {a: d for a, d in self.float_guard.items() if a in valid}
+        if self.drag and self.drag["addr"] not in valid:
+            self.drag = None        # dragged window died -> forget the session
 
     def remove(self, addr, mon=None):
         """Free addr's spot. Its sibling collapses up to reclaim the space; other
@@ -2696,6 +2703,14 @@ class Daemon(HyperZone):
                 self.emit("locate_end", {})
             else:
                 self._locate_frame(start=False)    # stream the next cursor position
+        if self.drag is not None:
+            if now >= self.drag["deadline"]:
+                log("drag: session for %s hit DRAG_MAX_S; leaving window as-is"
+                    % self.drag["addr"])
+                self.drag = None
+                self.save()
+            else:
+                self._drag_watch()           # fallback drop detection
         if self.layout_revert_at is not None and now >= self.layout_revert_at:
             self.revert_layout("timeout")   # nobody confirmed -> auto-restore
         if self.monitors_refresh_at is not None and now >= self.monitors_refresh_at:
@@ -2727,6 +2742,8 @@ class Daemon(HyperZone):
             deadlines.append(self.monitors_refresh_at)
         if self.locate_until is not None:
             deadlines.append(time.time() + LOCATE_POLL_S)   # keep sampling the cursor
+        if self.drag is not None:
+            deadlines.append(time.time() + DRAG_POLL_S)     # watch for a lost drop
         if self.capture_resume_at is not None:
             deadlines.append(self.capture_resume_at)
         if not deadlines:
@@ -2998,7 +3015,8 @@ class Daemon(HyperZone):
                 self.verify_at = now + VERIFY_AFTER_CMD
         elif cmd == "dump":
             for mon in self.mons.values():
-                log("STATE", mon.name, mon.dump(), "detached", self.detached)
+                log("STATE", mon.name, mon.dump(), "detached", self.detached,
+                    "drag", self.drag)
         elif cmd == "move" and active:
             self.cmd_move(active, arg)
         elif cmd == "tomon" and active:
@@ -3018,12 +3036,16 @@ class Daemon(HyperZone):
             self.cmd_toggle_float(active)
             self.verify_at = time.time() + VERIFY_AFTER_CMD
         elif cmd == "snap-drop" and active:
-            self.cmd_snap_drop(active)     # dropped on managed -> snap to cursor zone
+            self.cmd_snap_drop(active)     # one-shot: snap to cursor zone
             self.verify_at = time.time() + VERIFY_AFTER_CMD
-        elif cmd == "float-grab" and active:
-            self.cmd_float_grab(active)     # float-modifier drag STARTED -> detach now
         elif cmd == "float-drop" and active:
-            self.cmd_float_drop(active)     # dropped with float modifier -> leave loose
+            self.cmd_float_drop(active)     # one-shot: detach to free-floating
+        elif cmd == "drag-start" and active and arg in ("snap", "float", "tile", "both"):
+            self.cmd_drag_start(active, arg)
+        elif cmd == "drag-mod" and arg in ("ctrl-down", "ctrl-up", "shift-down", "shift-up"):
+            self.cmd_drag_mod(arg)          # session-scoped: needs no active window
+        elif cmd == "drag-drop":
+            self.cmd_drag_drop()            # session-scoped: needs no active window
 
     def _same_mon_neighbour(self, addr, direction):
         """True if a tiled window exists in `direction` on the SAME monitor/workspace
@@ -3566,17 +3588,19 @@ class Daemon(HyperZone):
         return best_any[1] if best_any else None
 
     def cmd_snap_drop(self, addr):
-        """A window was dropped on the managed screen: snap it into the zone/space
-        under the cursor — adopt it if it came from elsewhere, or move it if it was
-        already managed. Occupied tile -> subdivide (on the cursor's side); empty
-        zone -> take it whole; anywhere else -> fall back to fill order."""
-        deadline = self.float_guard.pop(addr, None)
-        if deadline and time.time() < deadline:
-            return    # mod-release slip at the end of a FLOAT drag -> window stays free
+        """One-shot: snap a window into the zone/space under the cursor on the
+        managed screen — adopt it if it came from elsewhere, or move it if it was
+        already managed."""
         c = self.client(addr)
         mon = self.managed_monitor_for(c)
         if not mon:
             return  # dropped on an unmanaged screen -> leave it to Hyprland
+        self._snap_into(addr, mon)
+
+    def _snap_into(self, addr, mon):
+        """Insert addr into mon's grid at the cursor. Occupied tile -> subdivide
+        (on the cursor's side); empty zone -> take it whole; own former space or
+        anywhere else -> snap back / fall back to fill order."""
         self.detached.discard(addr)
         self.was_managed.discard(addr)   # managed again -> no stale-float override due
         self.reprobe_min(addr)           # deliberate drop -> re-measure min in new zone
@@ -3619,30 +3643,9 @@ class Daemon(HyperZone):
         else:                                # size not readable yet -> plain float
             hbatch(['hl.dsp.window.float({action="enable", window="address:%s"})' % addr])
 
-    def cmd_float_grab(self, addr):
-        """A float-modifier drag STARTED on this window: detach it right away.
-        Floating needs no drop position — the drag itself leaves the window wherever
-        the user lets go — so acting at grab time makes the gesture immune to the
-        order the keys are released in (the release bind only fires if BOTH mods are
-        still held at button-up). Arm float_guard so the snap-drop that fires when
-        CTRL slips out early can't re-capture the window (see cmd_snap_drop)."""
-        mon = self.mon_of_addr(addr)
-        if mon:
-            self.remove(addr, mon)
-        else:
-            self._float_in_place(addr)   # unmanaged/native window: float it ourselves
-        self.detached.add(addr)
-        self.float_guard[addr] = time.time() + FLOAT_GUARD_S
-        self.paint(addr, True)        # amber from the moment it's grabbed
-        self.save()
-
     def cmd_float_drop(self, addr):
-        """A window was dropped with the float modifier still held: leave it
-        free-floating where it landed. After a float-grab this is just the clean
-        end of the gesture — disarm the guard so a LATER deliberate snap-drop of
-        the same window isn't swallowed. It still detaches for real when the drag
-        began as a SUPER-only snap drag and CTRL was added mid-drag."""
-        self.float_guard.pop(addr, None)
+        """One-shot: detach a window to free-floating where it is now (managed ->
+        out of the grid; unmanaged native tile -> floated in place)."""
         mon = self.mon_of_addr(addr)
         if mon:
             self.remove(addr, mon)
@@ -3651,6 +3654,155 @@ class Daemon(HyperZone):
         self.detached.add(addr)
         self.paint(addr, True)        # amber: free-floating
         self.save()
+
+    # ── drag session: Super+drag with live-switchable intent ──
+    # The drop ACTION (snap / float / tile) is decided by the modifiers held at
+    # DROP time, not at press time: drag-start arms the session with the starting
+    # intent, drag-mod events retarget it mid-drag (the border colour tracks the
+    # current intent — amber = will float, managed colour = will snap/tile), and
+    # drag-drop applies whatever intent is current. Two safety nets: a modifier
+    # released within DRAG_GRACE_S of the drop is a finger-slip (keep the prior
+    # intent), and if SUPER comes up before the button — so NO release bind can
+    # fire — _drag_watch notices the window stopped following the cursor.
+
+    def _drag_intent(self, ctrl, shift):
+        return "float" if ctrl else ("tile" if shift else "snap")
+
+    def cmd_drag_start(self, addr, kind):
+        c = self.client(addr)
+        if not c:
+            return
+        ctrl = kind in ("float", "both")
+        shift = kind in ("tile", "both")
+        self.drag = {
+            "addr": addr, "ctrl": ctrl, "shift": shift,
+            "intent": self._drag_intent(ctrl, shift),
+            "prev": None, "prev_until": 0.0,
+            "deadline": time.time() + DRAG_MAX_S,
+            "pulled": False,                       # taken out of grid / floated by us
+            "was_floating": bool(c.get("floating")),
+            "last_cur": None, "last_at": None, "travel": 0.0,
+        }
+        if self.drag["intent"] == "float":
+            self._drag_pull()      # float acts eagerly: pop free the moment it's grabbed
+        self._paint_intent()
+        log("drag-start", addr, kind, "->", self.drag["intent"])
+
+    def _drag_pull(self):
+        """Detach the session window NOW (float intent is eager): out of the grid
+        on managed screens, floated in place on unmanaged ones. Eager floating is
+        also what lets _drag_watch track the window (tiled layout-drags don't move
+        continuously)."""
+        d = self.drag
+        if not d or d["pulled"]:
+            return
+        mon = self.mon_of_addr(d["addr"])
+        if mon:
+            self.remove(d["addr"], mon)
+        else:
+            self._float_in_place(d["addr"])
+        self.detached.add(d["addr"])
+        d["pulled"] = True
+
+    def _paint_intent(self):
+        """Border = what the drop will do: amber -> ends up floating, managed
+        colour -> ends up snapped/tiled. Snap on an unmanaged screen keeps the
+        window's ORIGINAL state, so it shows that state's colour."""
+        d = self.drag
+        if not d:
+            return
+        c = self.client(d["addr"])
+        if d["intent"] == "float":
+            self.paint(d["addr"], True)
+        elif d["intent"] == "tile" or (c and self.managed_monitor_for(c)):
+            self.paint(d["addr"], False)
+        else:
+            self.paint(d["addr"], d["was_floating"])
+
+    def cmd_drag_mod(self, action):
+        d = self.drag
+        if not d:
+            return                    # no drag in flight: Ctrl/Shift taps are not ours
+        which, _, dirn = action.partition("-")
+        if d.get(which) == (dirn == "down"):
+            return                    # duplicate report (both keysym variants fired)
+        d[which] = (dirn == "down")
+        intent = self._drag_intent(d["ctrl"], d["shift"])
+        if intent == d["intent"]:
+            return
+        if dirn == "up":              # a downgrade may be a slip: remember what it was
+            d["prev"], d["prev_until"] = d["intent"], time.time() + DRAG_GRACE_S
+        else:
+            d["prev"] = None
+        d["intent"] = intent
+        if intent == "float":
+            self._drag_pull()         # pops free mid-drag: instant visible feedback
+        self._paint_intent()
+        log("drag-mod", action, "->", intent)
+
+    def cmd_drag_drop(self):
+        d = self.drag
+        if not d:
+            return
+        self.drag = None
+        now = time.time()
+        intent = d["prev"] if (d["prev"] and now < d["prev_until"]) else d["intent"]
+        addr = d["addr"]
+        c = self.client(addr)
+        log("drag-drop", addr, "intent", intent)
+        if not c:
+            return
+        if intent == "float":
+            mon = self.mon_of_addr(addr)
+            if mon:
+                self.remove(addr, mon)
+            self._float_in_place(addr)
+            self.detached.add(addr)
+            self.paint(addr, True)
+            self.save()
+            return
+        mon = self.managed_monitor_for(c)
+        if mon:                       # tile == snap on a managed screen: into the grid
+            self._snap_into(addr, mon)
+            self.verify_at = now + VERIFY_AFTER_CMD
+            return
+        # Unmanaged screen: tile forces native tiling; snap restores the window's
+        # original state (a pulled-then-reverted drag must put a tiled window back).
+        want_float = d["was_floating"] if intent == "snap" else False
+        if want_float:
+            self.detached.add(addr)
+            self.paint(addr, True)
+        else:
+            if c.get("floating"):
+                hbatch(['hl.dsp.window.float({action="disable", window="address:%s"})'
+                        % addr])
+            self.detached.discard(addr)
+            self.paint(addr, False)
+        self.save()
+
+    def _drag_watch(self):
+        """Fallback drop detection, polled while a session is live: once the
+        window is floating, it tracks the cursor 1:1 during a drag — so cursor
+        travel with the window standing still means the button was released with
+        no release bind matching (SUPER already up). Tiled layout-drags don't
+        move continuously, so they rely on the release binds + deadline only."""
+        d = self.drag
+        c = self.client(d["addr"])
+        pos = hjson("cursorpos") or {}
+        cx, cy = pos.get("x"), pos.get("y")
+        if not c or cx is None or not c.get("floating"):
+            return
+        at = tuple(c.get("at") or ())
+        if d["last_cur"] is not None:
+            if at == d["last_at"]:
+                lx, ly = d["last_cur"]
+                d["travel"] += abs(cx - lx) + abs(cy - ly)
+            else:
+                d["travel"] = 0.0     # window still following -> drag still live
+        d["last_cur"], d["last_at"] = (cx, cy), at
+        if d["travel"] >= DRAG_DIVERGE_PX:
+            log("drag-watch: divergence -> synthetic drop")
+            self.cmd_drag_drop()
 
     def _acquire_control_socket(self):
         """Singleton guard. If another daemon already answers the control socket:
@@ -3842,7 +3994,8 @@ def cli_fallback(cmd, arg):
 
 
 COMMANDS = ("daemon", "focus", "move", "tomon", "push", "swap", "toggle-float",
-            "snap-drop", "float-grab", "float-drop", "retile", "rearrange", "dump")
+            "snap-drop", "float-drop", "drag-start", "drag-mod", "drag-drop",
+            "retile", "rearrange", "dump")
 
 
 def main():

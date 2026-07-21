@@ -61,10 +61,24 @@ local hz = "python3 -S ~/.local/bin/hzctl.py"
 hl.bind(mainMod .. " + T",           hl.dsp.exec_cmd(hz .. " toggle-float"))
 hl.bind(mainMod .. " + SHIFT + T",   hl.dsp.exec_cmd(hz .. " rearrange"))
 hl.bind(mainMod .. " + CTRL + left", hl.dsp.exec_cmd(hz .. " move left"))   -- +right/up/down
-hl.bind(mainMod .. " + mouse:272",        hl.dsp.window.drag(), { mouse = true })
-hl.bind(mainMod .. " + mouse:272",        hl.dsp.exec_cmd(hz .. " snap-drop"),  { release = true })
-hl.bind(mainMod .. " + CTRL + mouse:272", hl.dsp.window.drag(), { mouse = true })
-hl.bind(mainMod .. " + CTRL + mouse:272", hl.dsp.exec_cmd(hz .. " float-drop"), { release = true })
+-- Mouse: Super+drag moves a window; the modifiers held at DROP time decide what
+-- happens (switchable mid-drag, border colour = current intent):
+--   Super -> snap into zone | +Ctrl -> leave floating | +Shift -> back to tiling
+local dragCombos = { [""] = "snap", [" + CTRL"] = "float",
+                     [" + SHIFT"] = "tile", [" + CTRL + SHIFT"] = "both" }
+for mods, intent in pairs(dragCombos) do
+    hl.bind(mainMod .. mods .. " + mouse:272", hl.dsp.window.drag(), { mouse = true })
+    hl.bind(mainMod .. mods .. " + mouse:272", hl.dsp.exec_cmd(hz .. " drag-start " .. intent))
+    hl.bind(mainMod .. mods .. " + mouse:272", hl.dsp.exec_cmd(hz .. " drag-drop"), { release = true })
+    for key, which in pairs({ Control_L = "ctrl", Control_R = "ctrl",
+                              Shift_L = "shift",  Shift_R = "shift" }) do
+        hl.bind(mainMod .. mods .. " + " .. key,
+                hl.dsp.exec_cmd(hz .. " drag-mod " .. which .. "-down"), { non_consuming = true })
+        hl.bind(mainMod .. mods .. " + " .. key,
+                hl.dsp.exec_cmd(hz .. " drag-mod " .. which .. "-up"),
+                { release = true, non_consuming = true })
+    end
+end
 ```
 
 ## The settings UI
