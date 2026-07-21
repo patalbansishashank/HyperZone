@@ -3600,6 +3600,25 @@ class Daemon(HyperZone):
             self.place(addr, mon)
         self.apply(mon)
 
+    def _float_in_place(self, addr):
+        """Make a natively-TILED window float at its current rect. On unmanaged
+        screens the float gesture has no grid to detach from — the window sits in
+        Hyprland's own layout, and dragging a tiled window just re-slots it into
+        the layout on release — so the gesture must do the floating itself.
+        Floating at the CURRENT size/position (not Hyprland's remembered float
+        geometry) keeps the window seamless under the cursor mid-drag, and
+        rewrites any stale zone-sized float memory left from a managed spell."""
+        c = self.client(addr)
+        if not c or c.get("floating") or c.get("fullscreen"):
+            return
+        sz, at = c.get("size"), c.get("at")
+        if sz and at and sz[0] > 1 and sz[1] > 1:
+            self.was_managed.discard(addr)   # float memory is being rewritten sanely
+            hbatch(float_geom_exprs(addr, int(sz[0]), int(sz[1]),
+                                    int(at[0]), int(at[1])))
+        else:                                # size not readable yet -> plain float
+            hbatch(['hl.dsp.window.float({action="enable", window="address:%s"})' % addr])
+
     def cmd_float_grab(self, addr):
         """A float-modifier drag STARTED on this window: detach it right away.
         Floating needs no drop position — the drag itself leaves the window wherever
@@ -3610,6 +3629,8 @@ class Daemon(HyperZone):
         mon = self.mon_of_addr(addr)
         if mon:
             self.remove(addr, mon)
+        else:
+            self._float_in_place(addr)   # unmanaged/native window: float it ourselves
         self.detached.add(addr)
         self.float_guard[addr] = time.time() + FLOAT_GUARD_S
         self.paint(addr, True)        # amber from the moment it's grabbed
@@ -3625,6 +3646,8 @@ class Daemon(HyperZone):
         mon = self.mon_of_addr(addr)
         if mon:
             self.remove(addr, mon)
+        else:
+            self._float_in_place(addr)   # unmanaged/native window: float it ourselves
         self.detached.add(addr)
         self.paint(addr, True)        # amber: free-floating
         self.save()
