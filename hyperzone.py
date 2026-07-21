@@ -3681,6 +3681,9 @@ class Daemon(HyperZone):
             "deadline": time.time() + DRAG_MAX_S,
             "pulled": False,                       # taken out of grid / floated by us
             "was_floating": bool(c.get("floating")),
+            "was_detached": addr in self.detached,  # amber is for HZ-DETACHED windows;
+                                                    # a merely-floating one keeps its
+                                                    # normal border on a snap drag
             "last_cur": None, "last_at": None, "travel": 0.0,
         }
         if self.drag["intent"] == "float":
@@ -3705,9 +3708,10 @@ class Daemon(HyperZone):
         d["pulled"] = True
 
     def _paint_intent(self):
-        """Border = what the drop will do: amber -> ends up floating, managed
-        colour -> ends up snapped/tiled. Snap on an unmanaged screen keeps the
-        window's ORIGINAL state, so it shows that state's colour."""
+        """Border = what the drop will do: amber -> ends up HZ-detached, managed
+        colour -> ends up snapped/tiled. Snap on an unmanaged screen restores the
+        window's ORIGINAL border: amber only if it was detached before the drag —
+        a merely-floating window being moved keeps its normal colour."""
         d = self.drag
         if not d:
             return
@@ -3717,7 +3721,7 @@ class Daemon(HyperZone):
         elif d["intent"] == "tile" or (c and self.managed_monitor_for(c)):
             self.paint(d["addr"], False)
         else:
-            self.paint(d["addr"], d["was_floating"])
+            self.paint(d["addr"], d["was_detached"])
 
     def cmd_drag_mod(self, action):
         d = self.drag
@@ -3767,11 +3771,16 @@ class Daemon(HyperZone):
             self.verify_at = now + VERIFY_AFTER_CMD
             return
         # Unmanaged screen: tile forces native tiling; snap restores the window's
-        # original state (a pulled-then-reverted drag must put a tiled window back).
+        # original state (a pulled-then-reverted drag must put a tiled window back,
+        # and a merely-floating window that was never HZ-detached stays pristine).
         want_float = d["was_floating"] if intent == "snap" else False
         if want_float:
-            self.detached.add(addr)
-            self.paint(addr, True)
+            if d["was_detached"]:
+                self.detached.add(addr)
+                self.paint(addr, True)
+            else:                     # plain move of a floating window: hands off
+                self.detached.discard(addr)   # undo a mid-drag float flirt
+                self.paint(addr, False)       # no-op unless we painted it this drag
         else:
             if c.get("floating"):
                 hbatch(['hl.dsp.window.float({action="disable", window="address:%s"})'
