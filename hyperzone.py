@@ -3691,18 +3691,23 @@ class Daemon(HyperZone):
         self._paint_intent()
         log("drag-start", addr, kind, "->", self.drag["intent"])
 
-    def _drag_pull(self):
-        """Detach the session window NOW (float intent is eager): out of the grid
-        on managed screens, floated in place on unmanaged ones. Eager floating is
-        also what lets _drag_watch track the window (tiled layout-drags don't move
-        continuously)."""
+    def _drag_pull(self, mid_drag=False):
+        """Detach the session window: out of the grid on managed screens (safe at
+        any time — the dragged window itself gets no geometry dispatch), floated
+        in place on unmanaged ones. mid_drag defers the native-tile float to the
+        DROP: re-geometrying a tile in the middle of a live drag fights
+        Hyprland's begin-drag reference state and teleports the window to its
+        remembered float rect. At drag START the drag has barely moved, so the
+        eager float lands invisibly."""
         d = self.drag
         if not d or d["pulled"]:
             return
         mon = self.mon_of_addr(d["addr"])
         if mon:
             self.remove(d["addr"], mon)
-        else:
+        elif not (self.client(d["addr"]) or {}).get("floating"):
+            if mid_drag:
+                return                # amber shows the intent; the drop will float it
             self._float_in_place(d["addr"])
         self.detached.add(d["addr"])
         d["pulled"] = True
@@ -3740,7 +3745,7 @@ class Daemon(HyperZone):
             d["prev"] = None
         d["intent"] = intent
         if intent == "float":
-            self._drag_pull()         # pops free mid-drag: instant visible feedback
+            self._drag_pull(mid_drag=True)   # grid pull is eager; native tiles wait
         self._paint_intent()
         log("drag-mod", action, "->", intent)
 
