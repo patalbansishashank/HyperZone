@@ -61,24 +61,37 @@ local hz = "python3 -S ~/.local/bin/hzctl.py"
 hl.bind(mainMod .. " + T",           hl.dsp.exec_cmd(hz .. " toggle-float"))
 hl.bind(mainMod .. " + SHIFT + T",   hl.dsp.exec_cmd(hz .. " rearrange"))
 hl.bind(mainMod .. " + CTRL + left", hl.dsp.exec_cmd(hz .. " move left"))   -- +right/up/down
--- Mouse: Super+drag moves a window; the modifiers held at DROP time decide what
--- happens (switchable mid-drag, border colour = current intent):
+-- Mouse: Super+drag moves a window; the LAST modifier pressed during the drag
+-- decides what the drop does (border colour = current intent):
 --   Super -> snap into zone | +Ctrl -> leave floating | +Shift -> back to tiling
 -- Nothing is applied until you let go, so a drag can cross any number of screens
 -- (managed or not) without the window being re-slotted out from under the cursor.
+-- Hyprland ends a drag on EVERY key event and only a PRESS bind can restart one,
+-- so each modifier press takes the drag straight back in the same input event.
+local hzDragging, hzMods = false, {}
+local hzGrab = hl.dsp.window.drag()
+local hzDrop = hl.dsp.exec_cmd(hz .. " drag-drop")
+hl.bind("mouse:272", function()             -- fires whatever mods are still held,
+    if hzDragging then hzDragging = false; hzDrop() end   -- so a drop is never lost
+end, { release = true, ignore_mods = true, non_consuming = true })
 local dragCombos = { [""] = "snap", [" + CTRL"] = "float",
                      [" + SHIFT"] = "tile", [" + CTRL + SHIFT"] = "both" }
 for mods, intent in pairs(dragCombos) do
+    local hzStart = hl.dsp.exec_cmd(hz .. " drag-start " .. intent)
     hl.bind(mainMod .. mods .. " + mouse:272", hl.dsp.window.drag(), { mouse = true })
-    hl.bind(mainMod .. mods .. " + mouse:272", hl.dsp.exec_cmd(hz .. " drag-start " .. intent))
-    hl.bind(mainMod .. mods .. " + mouse:272", hl.dsp.exec_cmd(hz .. " drag-drop"), { release = true })
+    hl.bind(mainMod .. mods .. " + mouse:272", function() hzDragging = true; hzStart() end)
     for key, which in pairs({ Control_L = "ctrl", Control_R = "ctrl",
                               Shift_L = "shift",  Shift_R = "shift" }) do
-        hl.bind(mainMod .. mods .. " + " .. key,
-                hl.dsp.exec_cmd(hz .. " drag-mod " .. which .. "-down"), { non_consuming = true })
-        hl.bind(mainMod .. mods .. " + " .. key,
-                hl.dsp.exec_cmd(hz .. " drag-mod " .. which .. "-up"),
-                { release = true, non_consuming = true })
+        local hzDown = hl.dsp.exec_cmd(hz .. " drag-mod " .. which .. "-down")
+        local hzUp   = hl.dsp.exec_cmd(hz .. " drag-mod " .. which .. "-up")
+        hl.bind(mainMod .. mods .. " + " .. key, function()
+            if hzDragging and not hzMods[key] then hzGrab(); hzDown() end
+            hzMods[key] = true
+        end, { non_consuming = true })
+        hl.bind(mainMod .. mods .. " + " .. key, function()
+            hzMods[key] = false
+            if hzDragging then hzUp() end
+        end, { release = true, non_consuming = true })
     end
 end
 ```

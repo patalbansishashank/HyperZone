@@ -133,8 +133,8 @@ FS_INSIST_WINDOW = 1.5       # re-fullscreen within this = app insists; stop fig
 MON_CACHE_TTL = 1.0          # monitors-list micro-cache (also event-invalidated)
 CROSS_PLACE_TIMEOUT = 2.0    # honour a cross-monitor move's aligned-zone intent this long
 DRAG_POLL_S = 0.05           # cursor/window sample cadence while a drag session is live
-DRAG_GRACE_S = 0.5           # a modifier released this close to the drop was a slip of
-                             # the fingers, not a change of mind: keep the prior intent
+DRAG_FOLLOW_S = 0.03         # cursor-follow cadence while the DAEMON carries the drag
+                             # (see _drag_follow_start: Hyprland's own drag is gone)
 DRAG_MAX_S = 45.0            # hard cap on a drag session (lost-drop safety)
 DRAG_DIVERGE_PX = 30         # cursor travel with the window standing still that counts
                              # as "the drag has ended" (fallback drop detection for when
@@ -2720,7 +2720,7 @@ class Daemon(HyperZone):
                 self.drag = None
                 self.save()
             else:
-                self._drag_watch()           # fallback drop detection
+                self._drag_watch()           # carry the drag / fallback drop detection
         if self.layout_revert_at is not None and now >= self.layout_revert_at:
             self.revert_layout("timeout")   # nobody confirmed -> auto-restore
         if self.monitors_refresh_at is not None and now >= self.monitors_refresh_at:
@@ -2753,7 +2753,9 @@ class Daemon(HyperZone):
         if self.locate_until is not None:
             deadlines.append(time.time() + LOCATE_POLL_S)   # keep sampling the cursor
         if self.drag is not None:
-            deadlines.append(time.time() + DRAG_POLL_S)     # watch for a lost drop
+            # carrying the drag needs a tighter beat than merely watching it
+            deadlines.append(time.time() +
+                             (DRAG_FOLLOW_S if self.drag["follow"] else DRAG_POLL_S))
         if self.capture_resume_at is not None:
             deadlines.append(self.capture_resume_at)
         if not deadlines:
@@ -3642,18 +3644,21 @@ class Daemon(HyperZone):
             self.place(addr, mon)
         self.apply(mon)
 
-    def _float_in_place(self, addr):
+    def _float_in_place(self, addr, rect=None):
         """Make a natively-TILED window float at its current rect. On unmanaged
         screens the float gesture has no grid to detach from — the window sits in
         Hyprland's own layout, and dragging a tiled window just re-slots it into
         the layout on release — so the gesture must do the floating itself.
         Floating at the CURRENT size/position (not Hyprland's remembered float
         geometry) keeps the window seamless under the cursor mid-drag, and
-        rewrites any stale zone-sized float memory left from a managed spell."""
+        rewrites any stale zone-sized float memory left from a managed spell.
+        `rect` overrides "current": at the end of a drag Hyprland has already put
+        the window back in the layout, so the rect the drag last had (sampled by
+        _drag_watch) is where the user actually let go — float it THERE."""
         c = self.client(addr)
         if not c or c.get("floating") or c.get("fullscreen"):
             return
-        sz, at = c.get("size"), c.get("at")
+        sz, at = (rect or c).get("size"), (rect or c).get("at")
         if sz and at and sz[0] > 1 and sz[1] > 1:
             self.was_managed.discard(addr)   # float memory is being rewritten sanely
             hbatch(float_geom_exprs(addr, int(sz[0]), int(sz[1]),
@@ -3674,14 +3679,25 @@ class Daemon(HyperZone):
         self.save()
 
     # ── drag session: Super+drag with live-switchable intent ──
-    # The drop ACTION (snap / float / tile) is decided by the modifiers held at
-    # DROP time, not at press time: drag-start arms the session with the starting
-    # intent, drag-mod events retarget it mid-drag (the border colour tracks the
-    # current intent — amber = will float, managed colour = will snap/tile), and
-    # drag-drop applies whatever intent is current. Two safety nets: a modifier
-    # released within DRAG_GRACE_S of the drop is a finger-slip (keep the prior
-    # intent), and if SUPER comes up before the button — so NO release bind can
-    # fire — _drag_watch notices the window stopped following the cursor.
+    # The drop ACTION (snap / float / tile) is decided by the daemon at DROP time,
+    # not by which release bind happened to match. drag-start arms the session with
+    # the intent of the press combo; a Ctrl/Shift PRESS mid-drag retargets it (LAST
+    # PRESS WINS — Ctrl = float, Shift = tile) and the border colour tracks it.
+    #
+    # THE COMPOSITOR RULE THIS IS BUILT AROUND (Hyprland 0.55.4, verified in
+    # CKeybindManager::onKeyEvent -> ensureMouseBindState): a window drag is ended
+    # by EVERY key event, press or release, before any bind is even looked at. A
+    # floating window then just stops under the hand; a window Hyprland picked up
+    # out of a tile is put straight back into the layout (the "it teleports and
+    # resizes itself" bug). Only a bind firing on a key PRESS can restart the drag
+    # (Actions::mouse reads the press flag — a release bind can only END one), so:
+    #   * the config re-arms the drag inside every Ctrl/Shift PRESS bind — same
+    #     input event, so the drag never visibly breaks;
+    #   * intent is last-press-wins, so switching modes never needs a release;
+    #   * if a modifier IS released mid-drag, the grab is gone for good and the
+    #     daemon carries the window itself (see _drag_follow_start).
+    # Last net: if SUPER comes up before the button, _drag_watch notices the window
+    # stopped following the cursor and drops it.
 
     def _drag_intent(self, ctrl, shift):
         return "float" if ctrl else ("tile" if shift else "snap")
@@ -3693,11 +3709,13 @@ class Daemon(HyperZone):
         ctrl = kind in ("float", "both")
         shift = kind in ("tile", "both")
         self.drag = {
-            "addr": addr, "ctrl": ctrl, "shift": shift,
+            "addr": addr,
             "intent": self._drag_intent(ctrl, shift),
-            "prev": None, "prev_until": 0.0,
             "deadline": time.time() + DRAG_MAX_S,
             "pulled": False,                       # taken out of grid / floated by us
+            "follow": None,                        # (dx, dy) while the DAEMON drags it
+            "rect": None,                          # last rect seen while floating: where
+                                                   # the window really was when let go
             "was_floating": bool(c.get("floating")),
             "from_grid": self.mon_of_addr(addr) is not None,  # came out of a zone: it is
                                                     # floating only because WE float our
@@ -3751,25 +3769,54 @@ class Daemon(HyperZone):
             self.paint(d["addr"], d["was_detached"])
 
     def cmd_drag_mod(self, action):
+        """Ctrl/Shift during a drag. LAST PRESS WINS: Ctrl -> float, Shift -> tile,
+        and a RELEASE never changes the intent — so switching modes never requires
+        letting a modifier go, which is what makes the gesture survive (a release
+        kills the compositor's drag with no way to restart it; a press takes it
+        straight back, done by the config bind itself)."""
         d = self.drag
         if not d:
             return                    # no drag in flight: Ctrl/Shift taps are not ours
         which, _, dirn = action.partition("-")
-        if d.get(which) == (dirn == "down"):
-            return                    # duplicate report (both keysym variants fired)
-        d[which] = (dirn == "down")
-        intent = self._drag_intent(d["ctrl"], d["shift"])
-        if intent == d["intent"]:
+        if dirn == "up":
+            self._drag_follow_start()  # grab is gone for good -> we carry the window
             return
-        if dirn == "up":              # a downgrade may be a slip: remember what it was
-            d["prev"], d["prev_until"] = d["intent"], time.time() + DRAG_GRACE_S
-        else:
-            d["prev"] = None
+        d["follow"] = None            # the bind re-armed it: Hyprland drags again
+        intent = "float" if which == "ctrl" else "tile"
+        if intent == d["intent"]:
+            return                    # already there (both keysym variants fire)
         d["intent"] = intent
         if intent == "float":
             self._drag_pull()         # grid pull is eager; native tiles wait for drop
         self._paint_intent()
         log("drag-mod", action, "->", intent)
+
+    def _drag_follow_start(self):
+        """Take the drag over from the compositor. A modifier RELEASED mid-drag ends
+        Hyprland's drag (it ends on every key event) and nothing can restart it: only
+        a bind firing on a key PRESS can, and this was a release. So from here the
+        daemon moves the window with the cursor itself, every DRAG_FOLLOW_S, until
+        the button comes up — coarser than the compositor's per-frame move, but the
+        window keeps following the hand instead of freezing under it. The next
+        modifier PRESS hands the drag back (cmd_drag_mod clears `follow`)."""
+        d = self.drag
+        if not d or d["follow"]:
+            return
+        c = self.client(d["addr"])
+        pos = hjson("cursorpos") or {}
+        cx, cy = pos.get("x"), pos.get("y")
+        if not c or cx is None:
+            return
+        at = c.get("at")
+        if not c.get("floating"):
+            # Hyprland floats a tile to drag it and puts it back when the drag ends,
+            # so the dead grab left it re-tiled: float it again where the drag was.
+            self._float_in_place(d["addr"], d["rect"])
+            at = (d["rect"] or {}).get("at", at)
+        if not at:
+            return
+        d["follow"] = (at[0] - cx, at[1] - cy)
+        log("drag-follow: daemon carries the drag (modifier released mid-drag)")
 
     def cmd_drag_drop(self):
         d = self.drag
@@ -3777,7 +3824,7 @@ class Daemon(HyperZone):
             return
         self.drag = None
         now = time.time()
-        intent = d["prev"] if (d["prev"] and now < d["prev_until"]) else d["intent"]
+        intent = d["intent"]
         addr = d["addr"]
         c = self.client(addr)
         log("drag-drop", addr, "intent", intent)
@@ -3788,7 +3835,10 @@ class Daemon(HyperZone):
         if old is not None and (old is not mon or intent == "float"):
             self.remove(addr, old)    # deferred crossing (see on_moved) / popped free
         if intent == "float":
-            self._float_in_place(addr)
+            # Hyprland re-tiles a window it picked up out of a tile the moment the
+            # drag ends, so float it back at the rect the drag last had, not at the
+            # layout slot it was just dumped into.
+            self._float_in_place(addr, d["rect"])
             self.detached.add(addr)
             self.paint(addr, True)
             self.save()
@@ -3825,18 +3875,32 @@ class Daemon(HyperZone):
         self.save()
 
     def _drag_watch(self):
-        """Fallback drop detection, polled while a session is live: once the
-        window is floating, it tracks the cursor 1:1 during a drag — so cursor
-        travel with the window standing still means the button was released with
-        no release bind matching (SUPER already up). Tiled layout-drags don't
-        move continuously, so they rely on the release binds + deadline only."""
+        """Polled while a session is live. Two jobs.
+
+        FOLLOW: once the daemon owns the drag (_drag_follow_start), keep the window
+        pinned under the cursor at its grab offset — that IS the drag now.
+
+        WATCH: otherwise, fallback drop detection — a floating window tracks the
+        cursor 1:1 during a real drag, so cursor travel with the window standing
+        still means the button was released with no release bind matching (SUPER
+        already up). Tiled layout-drags don't move continuously, so they rely on
+        the release binds + deadline only."""
         d = self.drag
-        c = self.client(d["addr"])
         pos = hjson("cursorpos") or {}
         cx, cy = pos.get("x"), pos.get("y")
-        if not c or cx is None or not c.get("floating"):
+        if cx is None:
+            return
+        if d["follow"]:
+            ox, oy = d["follow"]
+            hbatch(['hl.dsp.window.move({x=%d,y=%d, window="address:%s"})'
+                    % (int(cx + ox), int(cy + oy), d["addr"])])
+            return
+        c = self.client(d["addr"])
+        if not c or not c.get("floating"):
             return
         at = tuple(c.get("at") or ())
+        if at and c.get("size"):
+            d["rect"] = {"at": list(at), "size": list(c["size"])}   # where the drag is
         if d["last_cur"] is not None:
             if at == d["last_at"]:
                 lx, ly = d["last_cur"]
