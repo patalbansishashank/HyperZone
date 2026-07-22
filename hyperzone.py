@@ -19,9 +19,10 @@ Run as:
         move <left|right|up|down>   # move focused window within its screen
         tomon <left|right|up|down>  # send focused window to the next monitor
         toggle-float                # detach (free float) / re-attach focused window
-        drag-start <snap|float|tile|both>   # a Super+drag began with this intent
-        drag-mod <ctrl|shift>-<down|up>     # modifier changed mid-drag -> retarget
-        drag-drop                   # button released -> apply the final intent
+        drag-start <snap|float>     # a Super+drag began with this intent
+        drag-toggle                 # Ctrl pressed mid-drag -> flip snap <-> float
+        drag-carry                  # Ctrl released -> the daemon takes the drag over
+        drag-drop                   # button released -> apply the armed intent
         snap-drop                   # one-shot: snap window into cursor's zone
         float-drop                  # one-shot: detach window to free-floating
         retile                      # re-adopt & relayout tracked windows
@@ -132,14 +133,12 @@ DENY_PLACE_MAX_TRIES = 12    # …until it stops changing (settled) or this many
 FS_INSIST_WINDOW = 1.5       # re-fullscreen within this = app insists; stop fighting
 MON_CACHE_TTL = 1.0          # monitors-list micro-cache (also event-invalidated)
 CROSS_PLACE_TIMEOUT = 2.0    # honour a cross-monitor move's aligned-zone intent this long
-DRAG_POLL_S = 0.05           # cursor/window sample cadence while a drag session is live
-DRAG_FOLLOW_S = 0.03         # cursor-follow cadence while the DAEMON carries the drag
-                             # (see _drag_follow_start: Hyprland's own drag is gone)
+DRAG_POLL_S = 0.05           # sample cadence while HYPRLAND is driving the drag
+DRAG_CARRY_S = 0.012         # cursor-follow cadence once WE are driving it (~83 Hz;
+                             # a hyprctl round trip costs ~0.02 ms, so this is cheap)
 DRAG_MAX_S = 45.0            # hard cap on a drag session (lost-drop safety)
-DRAG_DIVERGE_PX = 30         # cursor travel with the window standing still that counts
-                             # as "the drag has ended" (fallback drop detection for when
-                             # SUPER is released before the button, so no release bind
-                             # can fire; > Hyprland's edge-snap sticky range)
+DRAG_IDLE_S = 6.0            # carried, but the cursor has not moved this long: assume
+                             # the drop was missed and finish the gesture
 CAPTURE_MODE_TIMEOUT = 20.0  # auto-restore binds if the UI's key-capture never resumes them
 
 
@@ -2755,7 +2754,7 @@ class Daemon(HyperZone):
         if self.drag is not None:
             # carrying the drag needs a tighter beat than merely watching it
             deadlines.append(time.time() +
-                             (DRAG_FOLLOW_S if self.drag["follow"] else DRAG_POLL_S))
+                             (DRAG_CARRY_S if self.drag["carry"] else DRAG_POLL_S))
         if self.capture_resume_at is not None:
             deadlines.append(self.capture_resume_at)
         if not deadlines:
@@ -3060,12 +3059,14 @@ class Daemon(HyperZone):
             self.verify_at = time.time() + VERIFY_AFTER_CMD
         elif cmd == "float-drop" and active:
             self.cmd_float_drop(active)     # one-shot: detach to free-floating
-        elif cmd == "drag-start" and active and arg in ("snap", "float", "tile", "both"):
+        elif cmd == "drag-start" and active and arg in ("snap", "float"):
             self.cmd_drag_start(active, arg)
-        elif cmd == "drag-mod" and arg in ("ctrl-down", "ctrl-up", "shift-down", "shift-up"):
-            self.cmd_drag_mod(arg)          # session-scoped: needs no active window
+        elif cmd == "drag-toggle":          # the three below are session-scoped:
+            self.cmd_drag_toggle()          # they act on the drag, not on whatever
+        elif cmd == "drag-carry":           # window happens to be focused
+            self.cmd_drag_carry()
         elif cmd == "drag-drop":
-            self.cmd_drag_drop()            # session-scoped: needs no active window
+            self.cmd_drag_drop()
 
     def _same_mon_neighbour(self, addr, direction):
         """True if a tiled window exists in `direction` on the SAME monitor/workspace
@@ -3678,69 +3679,108 @@ class Daemon(HyperZone):
         self.paint(addr, True)        # amber: free-floating
         self.save()
 
-    # ── drag session: Super+drag with live-switchable intent ──
-    # The drop ACTION (snap / float / tile) is decided by the daemon at DROP time,
-    # not by which release bind happened to match. drag-start arms the session with
-    # the intent of the press combo; a Ctrl/Shift PRESS mid-drag retargets it (LAST
-    # PRESS WINS — Ctrl = float, Shift = tile) and the border colour tracks it.
+    # ── drag session: Super+drag, Ctrl toggles what the drop will do ──
+    # Super+left-drag is Hyprland's own drag, untouched. Ctrl TOGGLES the drop
+    # between the two things a drop can mean — snap (into the zone under the
+    # cursor on a managed screen, back into native tiling on an unmanaged one)
+    # and float (leave it free-floating, amber border) — and the border colour
+    # says which one is armed. Nothing is applied until the button comes up.
     #
-    # THE COMPOSITOR RULE THIS IS BUILT AROUND (Hyprland 0.55.4, verified in
-    # CKeybindManager::onKeyEvent -> ensureMouseBindState): a window drag is ended
-    # by EVERY key event, press or release, before any bind is even looked at. A
-    # floating window then just stops under the hand; a window Hyprland picked up
-    # out of a tile is put straight back into the layout (the "it teleports and
-    # resizes itself" bug). Only a bind firing on a key PRESS can restart the drag
-    # (Actions::mouse reads the press flag — a release bind can only END one), so:
-    #   * the config re-arms the drag inside every Ctrl/Shift PRESS bind — same
-    #     input event, so the drag never visibly breaks;
-    #   * intent is last-press-wins, so switching modes never needs a release;
-    #   * if a modifier IS released mid-drag, the grab is gone for good and the
-    #     daemon carries the window itself (see _drag_follow_start).
-    # Last net: if SUPER comes up before the button, _drag_watch notices the window
-    # stopped following the cursor and drops it.
-
-    def _drag_intent(self, ctrl, shift):
-        return "float" if ctrl else ("tile" if shift else "snap")
+    # WHY THE DAEMON EVER TOUCHES THE DRAG (Hyprland 0.55.4, from the source:
+    # CKeybindManager::onKeyEvent -> ensureMouseBindState): a window drag is
+    # ended by EVERY key event, press AND release, before any bind is looked at,
+    # and only a bind firing on a key PRESS can start one again (Actions::mouse
+    # reads the press flag). A Ctrl TAP therefore always ends its own drag on the
+    # release, whatever the config does — there is no bind that can undo that.
+    # So we don't fight it: the first Ctrl event hands the drag to the daemon
+    # (_drag_carry_start), which then moves the window with the cursor itself
+    # until the drop. One deterministic hand-over, instead of a tug of war with
+    # the compositor on every keystroke.
 
     def cmd_drag_start(self, addr, kind):
         c = self.client(addr)
         if not c:
             return
-        ctrl = kind in ("float", "both")
-        shift = kind in ("tile", "both")
         self.drag = {
             "addr": addr,
-            "intent": self._drag_intent(ctrl, shift),
+            "intent": "float" if kind == "float" else "snap",
             "deadline": time.time() + DRAG_MAX_S,
-            "pulled": False,                       # taken out of grid / floated by us
-            "follow": None,                        # (dx, dy) while the DAEMON drags it
-            "rect": None,                          # last rect seen while floating: where
-                                                   # the window really was when let go
-            "was_floating": bool(c.get("floating")),
+            "pulled": False,                       # taken out of the grid by us
+            "carry": None,                         # (dx, dy) once WE drag it
+            "carry_tiled": False,                  # it was a native tile when we took over
+            "rect": None,                          # where the drag actually is
+            "moved_to": None,                      # last position we commanded
+            "last_cur": None, "idle_at": 0.0,
             "from_grid": self.mon_of_addr(addr) is not None,  # came out of a zone: it is
                                                     # floating only because WE float our
-                                                    # tiles, so "restore what it was" on
-                                                    # an unmanaged screen means DOCK it
-
+                                                    # tiles, so a snap drop on an
+                                                    # unmanaged screen means DOCK it
             "was_detached": addr in self.detached,  # amber is for HZ-DETACHED windows;
                                                     # a merely-floating one keeps its
                                                     # normal border on a snap drag
-            "last_cur": None, "last_at": None, "travel": 0.0,
         }
         if self.drag["intent"] == "float":
-            self._drag_pull()      # grid windows pop free at the grab; tiles at the drop
+            self._drag_pull()      # grid windows pop free at the grab
         self._paint_intent()
-        log("drag-start", addr, kind, "->", self.drag["intent"])
+        log("drag-start", addr, "->", self.drag["intent"])
+
+    def cmd_drag_toggle(self):
+        """Ctrl pressed during a drag: flip the drop between snap and float. The
+        keypress has already killed Hyprland's drag (it always does), so this is
+        also where the daemon takes the drag over."""
+        d = self.drag
+        if not d:
+            return                    # no drag in flight: Ctrl taps are not ours
+        self._drag_carry_start()
+        d["intent"] = "snap" if d["intent"] == "float" else "float"
+        if d["intent"] == "float":
+            self._drag_pull()
+        self._paint_intent()
+        log("drag-toggle ->", d["intent"])
+
+    def cmd_drag_carry(self):
+        """Ctrl RELEASED during a drag. Nothing to decide — but that release ended
+        Hyprland's drag with no bind able to restart it, so pick the window up."""
+        if self.drag:
+            self._drag_carry_start()
+
+    def _drag_carry_start(self):
+        """Start moving the window with the cursor ourselves. Pins it at whatever
+        offset it has right now, so it neither jumps nor stops under the hand, and
+        turns its animation off for the duration: an animated window chases a moved
+        goal instead of sitting on it, which would make the carried drag rubber-band
+        (Hyprland warps instead, but only for the window IT is dragging)."""
+        d = self.drag
+        if d["carry"] is not None:
+            return
+        pos = hjson("cursorpos") or {}
+        cx, cy = pos.get("x"), pos.get("y")
+        c = self.client(d["addr"])
+        if not c or cx is None:
+            return
+        if not c.get("floating"):
+            # A native tile: Hyprland floats one to drag it and drops it straight
+            # back into the layout when that drag ends — which the keypress just
+            # did. Float it again where the drag really was (sampled below).
+            d["carry_tiled"] = True
+            self._float_in_place(d["addr"], d["rect"])
+        rect = d["rect"] if (d["carry_tiled"] and d["rect"]) else \
+            {"at": c.get("at"), "size": c.get("size")}
+        at = (rect or {}).get("at") or [cx, cy]
+        d["rect"] = rect
+        d["carry"] = (at[0] - cx, at[1] - cy)
+        d["last_cur"], d["idle_at"] = (cx, cy), time.time()
+        hbatch(['hl.dsp.window.set_prop({window="address:%s", prop="animation", '
+                'value="none"})' % d["addr"]])
+        log("drag-carry: HyperZone is driving the drag (was tiled: %s)" % d["carry_tiled"])
 
     def _drag_pull(self):
-        """Detach the session window: out of the grid on managed screens — safe at
-        any time, remove() never dispatches geometry to the dragged window itself.
-        NATIVE TILES ARE NEVER FLOATED WHILE THE SESSION LIVES: float-enabling a
-        window Hyprland is actively dragging both teleports it (remembered-float-
-        rect restore beats our in-place pin) and BREAKS THE DRAG GRAB — the drag
-        began in layout mode, the window stops following the cursor (seen in the
-        wild as drag-watch false-firing mid-drag). The tile keeps its layout drag,
-        amber shows the intent, and the DROP floats it in place."""
+        """Take the session window out of the grid on managed screens — safe at any
+        time, remove() never dispatches geometry to the dragged window itself. A
+        NATIVE TILE IS NEVER FLOATED WHILE HYPRLAND IS DRAGGING IT: float-enabling
+        it there both teleports it (remembered-float-rect restore beats an in-place
+        pin) and breaks the grab. It is already floating anyway — Hyprland floats a
+        tile to drag it — and the drop decides where it ends up."""
         d = self.drag
         if not d or d["pulled"]:
             return
@@ -3763,60 +3803,10 @@ class Daemon(HyperZone):
         c = self.client(d["addr"])
         if d["intent"] == "float":
             self.paint(d["addr"], True)
-        elif d["intent"] == "tile" or (c and self.managed_monitor_for(c)):
+        elif c and self.managed_monitor_for(c):
             self.paint(d["addr"], False)
         else:
             self.paint(d["addr"], d["was_detached"])
-
-    def cmd_drag_mod(self, action):
-        """Ctrl/Shift during a drag. LAST PRESS WINS: Ctrl -> float, Shift -> tile,
-        and a RELEASE never changes the intent — so switching modes never requires
-        letting a modifier go, which is what makes the gesture survive (a release
-        kills the compositor's drag with no way to restart it; a press takes it
-        straight back, done by the config bind itself)."""
-        d = self.drag
-        if not d:
-            return                    # no drag in flight: Ctrl/Shift taps are not ours
-        which, _, dirn = action.partition("-")
-        if dirn == "up":
-            self._drag_follow_start()  # grab is gone for good -> we carry the window
-            return
-        d["follow"] = None            # the bind re-armed it: Hyprland drags again
-        intent = "float" if which == "ctrl" else "tile"
-        if intent == d["intent"]:
-            return                    # already there (both keysym variants fire)
-        d["intent"] = intent
-        if intent == "float":
-            self._drag_pull()         # grid pull is eager; native tiles wait for drop
-        self._paint_intent()
-        log("drag-mod", action, "->", intent)
-
-    def _drag_follow_start(self):
-        """Take the drag over from the compositor. A modifier RELEASED mid-drag ends
-        Hyprland's drag (it ends on every key event) and nothing can restart it: only
-        a bind firing on a key PRESS can, and this was a release. So from here the
-        daemon moves the window with the cursor itself, every DRAG_FOLLOW_S, until
-        the button comes up — coarser than the compositor's per-frame move, but the
-        window keeps following the hand instead of freezing under it. The next
-        modifier PRESS hands the drag back (cmd_drag_mod clears `follow`)."""
-        d = self.drag
-        if not d or d["follow"]:
-            return
-        c = self.client(d["addr"])
-        pos = hjson("cursorpos") or {}
-        cx, cy = pos.get("x"), pos.get("y")
-        if not c or cx is None:
-            return
-        at = c.get("at")
-        if not c.get("floating"):
-            # Hyprland floats a tile to drag it and puts it back when the drag ends,
-            # so the dead grab left it re-tiled: float it again where the drag was.
-            self._float_in_place(d["addr"], d["rect"])
-            at = (d["rect"] or {}).get("at", at)
-        if not at:
-            return
-        d["follow"] = (at[0] - cx, at[1] - cy)
-        log("drag-follow: daemon carries the drag (modifier released mid-drag)")
 
     def cmd_drag_drop(self):
         d = self.drag
@@ -3824,8 +3814,10 @@ class Daemon(HyperZone):
             return
         self.drag = None
         now = time.time()
-        intent = d["intent"]
-        addr = d["addr"]
+        intent, addr = d["intent"], d["addr"]
+        if d["carry"] is not None:      # give the window its animations back first,
+            hbatch(['hl.dsp.window.set_prop({window="address:%s", prop="animation", '
+                    'value="unset"})' % addr])          # so the drop itself animates
         c = self.client(addr)
         log("drag-drop", addr, "intent", intent)
         if not c:
@@ -3843,25 +3835,16 @@ class Daemon(HyperZone):
             self.paint(addr, True)
             self.save()
             return
-        if mon:                       # tile == snap on a managed screen: into the grid
+        if mon:                       # managed screen: into the zone under the cursor
             self._snap_into(addr, mon)
             self.verify_at = now + VERIFY_AFTER_CMD
             return
-        # Unmanaged screen: tile forces native tiling; snap restores the window's
-        # original state (a pulled-then-reverted drag must put a tiled window back,
-        # and a merely-floating window that was never HZ-detached stays pristine).
-        # A window that came out of a ZONE has no original state here — it was
-        # floating only because we float our tiles — so it docks natively, which is
-        # what crossing onto an unmanaged screen has always done, now at the drop.
-        want_float = intent == "snap" and d["was_floating"] and not d["from_grid"]
-        if want_float:
-            if d["was_detached"]:
-                self.detached.add(addr)
-                self.paint(addr, True)
-            else:                     # plain move of a floating window: hands off
-                self.detached.discard(addr)   # undo a mid-drag float flirt
-                self.paint(addr, False)       # no-op unless we painted it this drag
-        else:
+        # Unmanaged screen: snap means "put it back the way it was". A window that
+        # came out of a ZONE (from_grid), or one we found tiled when we took the
+        # drag over (carry_tiled), docks natively — that is the state it had. Any
+        # other window is one Hyprland was dragging on its own terms: it has already
+        # left it floating (or re-tiled it) exactly as it found it, so hands off.
+        if d["from_grid"] or d["carry_tiled"]:
             if c.get("floating"):
                 hbatch(['hl.dsp.window.float({action="disable", window="address:%s"})'
                         % addr])
@@ -3872,45 +3855,49 @@ class Daemon(HyperZone):
                     self.was_managed.add(addr)
             self.detached.discard(addr)
             self.paint(addr, False)
+        elif d["was_detached"]:
+            self.detached.add(addr)
+            self.paint(addr, True)
+        else:
+            self.detached.discard(addr)   # undo a mid-drag float flirt
+            self.paint(addr, False)       # no-op unless we painted it this drag
         self.save()
 
     def _drag_watch(self):
-        """Polled while a session is live. Two jobs.
+        """Polled while a session is live. Before the hand-over it just samples
+        where the drag is (the drop needs that rect once Hyprland has re-tiled the
+        window out from under it); after it, this IS the drag — the window is
+        pinned under the cursor at its grab offset.
 
-        FOLLOW: once the daemon owns the drag (_drag_follow_start), keep the window
-        pinned under the cursor at its grab offset — that IS the drag now.
-
-        WATCH: otherwise, fallback drop detection — a floating window tracks the
-        cursor 1:1 during a real drag, so cursor travel with the window standing
-        still means the button was released with no release bind matching (SUPER
-        already up). Tiled layout-drags don't move continuously, so they rely on
-        the release binds + deadline only."""
+        The idle check is the safety net: the window only stays glued to the cursor
+        while the button is down, so if the drop was somehow missed, a still cursor
+        finishes the gesture rather than leaving the window stuck to the pointer."""
         d = self.drag
+        if d["carry"] is None:
+            c = self.client(d["addr"])
+            if c and c.get("floating") and c.get("at") and c.get("size"):
+                d["rect"] = {"at": list(c["at"]), "size": list(c["size"])}
+            return
         pos = hjson("cursorpos") or {}
         cx, cy = pos.get("x"), pos.get("y")
         if cx is None:
             return
-        if d["follow"]:
-            ox, oy = d["follow"]
-            hbatch(['hl.dsp.window.move({x=%d,y=%d, window="address:%s"})'
-                    % (int(cx + ox), int(cy + oy), d["addr"])])
-            return
-        c = self.client(d["addr"])
-        if not c or not c.get("floating"):
-            return
-        at = tuple(c.get("at") or ())
-        if at and c.get("size"):
-            d["rect"] = {"at": list(at), "size": list(c["size"])}   # where the drag is
-        if d["last_cur"] is not None:
-            if at == d["last_at"]:
-                lx, ly = d["last_cur"]
-                d["travel"] += abs(cx - lx) + abs(cy - ly)
-            else:
-                d["travel"] = 0.0     # window still following -> drag still live
-        d["last_cur"], d["last_at"] = (cx, cy), at
-        if d["travel"] >= DRAG_DIVERGE_PX:
-            log("drag-watch: divergence -> synthetic drop")
+        now = time.time()
+        if (cx, cy) != d["last_cur"]:
+            d["last_cur"], d["idle_at"] = (cx, cy), now
+        elif now - d["idle_at"] > DRAG_IDLE_S:
+            log("drag: carried with a still cursor for %gs -> finishing the gesture"
+                % DRAG_IDLE_S)
             self.cmd_drag_drop()
+            return
+        x, y = int(cx + d["carry"][0]), int(cy + d["carry"][1])
+        if d["moved_to"] == (x, y):
+            return
+        d["moved_to"] = (x, y)
+        d["rect"] = {"at": [x, y], "size": (d["rect"] or {}).get("size")}
+        hbatch(['hl.dsp.window.move({x=%d,y=%d, window="address:%s"})'
+                % (x, y, d["addr"])])
+
 
     def _acquire_control_socket(self):
         """Singleton guard. If another daemon already answers the control socket:
@@ -4102,7 +4089,8 @@ def cli_fallback(cmd, arg):
 
 
 COMMANDS = ("daemon", "focus", "move", "tomon", "push", "swap", "toggle-float",
-            "snap-drop", "float-drop", "drag-start", "drag-mod", "drag-drop",
+            "snap-drop", "float-drop", "drag-start", "drag-toggle", "drag-carry",
+            "drag-drop",
             "retile", "rearrange", "dump")
 
 

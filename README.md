@@ -61,42 +61,40 @@ local hz = "python3 -S ~/.local/bin/hzctl.py"
 hl.bind(mainMod .. " + T",           hl.dsp.exec_cmd(hz .. " toggle-float"))
 hl.bind(mainMod .. " + SHIFT + T",   hl.dsp.exec_cmd(hz .. " rearrange"))
 hl.bind(mainMod .. " + CTRL + left", hl.dsp.exec_cmd(hz .. " move left"))   -- +right/up/down
--- Mouse: Super+drag moves a window; the LAST modifier pressed during the drag
--- decides what the drop does (border colour = current intent):
---   Super -> snap into zone | +Ctrl -> leave floating | +Shift -> back to tiling
--- Nothing is applied until you let go, so a drag can cross any number of screens
--- (managed or not) without the window being re-slotted out from under the cursor.
--- Hyprland ends a drag on EVERY key event and only a PRESS bind can restart one,
--- so each modifier press takes the drag straight back in the same input event.
--- (dispatchers are not callable from a Lua callback — hl.dispatch() fires them)
-local hzDragging, hzMods = false, {}
-local hzGrab = hl.dsp.window.drag()
+-- Mouse: Super+drag moves a window (Hyprland's own drag, untouched). CTRL
+-- TOGGLES what letting go will do, and the border colour says which is armed:
+--   normal colour -> snap: into the zone under the cursor on a managed screen,
+--                    back into native tiling on an unmanaged one
+--   amber         -> float: leave it free-floating right where it was dropped
+-- Starting with Ctrl held just starts on the float side. Nothing is applied
+-- until the button comes up, so a drag can cross any number of screens.
+--   Hyprland ends a window drag on EVERY key event and only a bind firing on a
+-- key PRESS can start one again — a Ctrl tap therefore always ends its own drag
+-- on the release, and no bind can undo that. So the first Ctrl event hands the
+-- drag to the daemon, which moves the window with the cursor itself until the
+-- drop. `ignore_mods` makes each bind fire exactly once per physical press
+-- (without it Hyprland re-fires mod-mismatched binds on the release too), and
+-- dispatchers are not callable from a Lua callback — hl.dispatch() fires them.
+local hzDragging = false
+local hzStart, hzStartF = hl.dsp.exec_cmd(hz .. " drag-start snap"),
+                          hl.dsp.exec_cmd(hz .. " drag-start float")
+local hzToggle, hzCarry = hl.dsp.exec_cmd(hz .. " drag-toggle"),
+                          hl.dsp.exec_cmd(hz .. " drag-carry")
 local hzDrop = hl.dsp.exec_cmd(hz .. " drag-drop")
-hl.bind("mouse:272", function()             -- fires whatever mods are still held,
-    if hzDragging then hzDragging = false; hl.dispatch(hzDrop) end  -- drop never lost
+hl.bind(mainMod .. " + mouse:272", hl.dsp.window.drag(), { mouse = true })
+hl.bind(mainMod .. " + mouse:272", function() hzDragging = true; hl.dispatch(hzStart) end)
+hl.bind(mainMod .. " + CTRL + mouse:272", hl.dsp.window.drag(), { mouse = true })
+hl.bind(mainMod .. " + CTRL + mouse:272", function() hzDragging = true; hl.dispatch(hzStartF) end)
+hl.bind("mouse:272", function()          -- fires whatever mods are still held, so
+    if hzDragging then hzDragging = false; hl.dispatch(hzDrop) end   -- no lost drop
 end, { release = true, ignore_mods = true, non_consuming = true })
-local dragCombos = { [""] = "snap", [" + CTRL"] = "float",
-                     [" + SHIFT"] = "tile", [" + CTRL + SHIFT"] = "both" }
-for mods, intent in pairs(dragCombos) do
-    local hzStart = hl.dsp.exec_cmd(hz .. " drag-start " .. intent)
-    hl.bind(mainMod .. mods .. " + mouse:272", hl.dsp.window.drag(), { mouse = true })
-    hl.bind(mainMod .. mods .. " + mouse:272",
-            function() hzDragging = true; hl.dispatch(hzStart) end)
-    for key, which in pairs({ Control_L = "ctrl", Control_R = "ctrl",
-                              Shift_L = "shift",  Shift_R = "shift" }) do
-        local hzDown = hl.dsp.exec_cmd(hz .. " drag-mod " .. which .. "-down")
-        local hzUp   = hl.dsp.exec_cmd(hz .. " drag-mod " .. which .. "-up")
-        hl.bind(mainMod .. mods .. " + " .. key, function()
-            if hzDragging and not hzMods[key] then
-                hl.dispatch(hzGrab); hl.dispatch(hzDown)   -- take the drag back
-            end
-            hzMods[key] = true
-        end, { non_consuming = true })
-        hl.bind(mainMod .. mods .. " + " .. key, function()
-            hzMods[key] = false
-            if hzDragging then hl.dispatch(hzUp) end
-        end, { release = true, non_consuming = true })
-    end
+for _, key in ipairs({ "Control_L", "Control_R" }) do
+    hl.bind(key, function()                      -- press: flip snap <-> float
+        if hzDragging then hl.dispatch(hzToggle) end
+    end, { ignore_mods = true, non_consuming = true })
+    hl.bind(key, function()                      -- release: it just killed the drag
+        if hzDragging then hl.dispatch(hzCarry) end
+    end, { release = true, ignore_mods = true, non_consuming = true })
 end
 ```
 
