@@ -24,7 +24,7 @@ COMMANDS = ("focus", "move", "tomon", "push", "swap", "toggle-float", "snap-drop
             "float-drop", "drag-start", "drag-toggle", "drag-carry", "drag-drop",
             "retile", "rearrange", "dump", "locate")
 ARGS = (None, "left", "right", "up", "down",
-        "snap", "float")                                       # drag-start intents
+        "flip")                          # drag-start: Ctrl was held at the grab
 
 
 def dispatch(expr):

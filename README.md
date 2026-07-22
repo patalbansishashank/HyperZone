@@ -66,8 +66,11 @@ hl.bind(mainMod .. " + CTRL + left", hl.dsp.exec_cmd(hz .. " move left"))   -- +
 --   normal colour -> snap: into the zone under the cursor on a managed screen,
 --                    back into native tiling on an unmanaged one
 --   amber         -> float: leave it free-floating right where it was dropped
--- Starting with Ctrl held just starts on the float side. Nothing is applied
--- until the button comes up, so a drag can cross any number of screens.
+-- The toggle starts at whatever the window already is: a free-floating (amber)
+-- window starts on the float side, a tiled one on the snap side, so a drag never
+-- changes anything by itself and Ctrl always flips the colour. Holding Ctrl as
+-- the drag begins starts on the other side. Nothing is applied until the button
+-- comes up, so a drag can cross any number of screens.
 --   Hyprland ends a window drag on EVERY key event and only a bind firing on a
 -- key PRESS can start one again — a Ctrl tap therefore always ends its own drag
 -- on the release, and no bind can undo that. So the first Ctrl event hands the
@@ -76,8 +79,8 @@ hl.bind(mainMod .. " + CTRL + left", hl.dsp.exec_cmd(hz .. " move left"))   -- +
 -- (without it Hyprland re-fires mod-mismatched binds on the release too), and
 -- dispatchers are not callable from a Lua callback — hl.dispatch() fires them.
 local hzDragging = false
-local hzStart, hzStartF = hl.dsp.exec_cmd(hz .. " drag-start snap"),
-                          hl.dsp.exec_cmd(hz .. " drag-start float")
+local hzStart, hzStartF = hl.dsp.exec_cmd(hz .. " drag-start"),
+                          hl.dsp.exec_cmd(hz .. " drag-start flip")
 local hzToggle, hzCarry = hl.dsp.exec_cmd(hz .. " drag-toggle"),
                           hl.dsp.exec_cmd(hz .. " drag-carry")
 local hzDrop = hl.dsp.exec_cmd(hz .. " drag-drop")

@@ -19,7 +19,7 @@ Run as:
         move <left|right|up|down>   # move focused window within its screen
         tomon <left|right|up|down>  # send focused window to the next monitor
         toggle-float                # detach (free float) / re-attach focused window
-        drag-start <snap|float>     # a Super+drag began with this intent
+        drag-start [flip]           # a Super+drag began (flip: Ctrl was already held)
         drag-toggle                 # Ctrl pressed mid-drag -> flip snap <-> float
         drag-carry                  # Ctrl released -> the daemon takes the drag over
         drag-drop                   # button released -> apply the armed intent
@@ -3059,7 +3059,7 @@ class Daemon(HyperZone):
             self.verify_at = time.time() + VERIFY_AFTER_CMD
         elif cmd == "float-drop" and active:
             self.cmd_float_drop(active)     # one-shot: detach to free-floating
-        elif cmd == "drag-start" and active and arg in ("snap", "float"):
+        elif cmd == "drag-start" and active and arg in (None, "flip"):
             self.cmd_drag_start(active, arg)
         elif cmd == "drag-toggle":          # the three below are session-scoped:
             self.cmd_drag_toggle()          # they act on the drag, not on whatever
@@ -3698,12 +3698,21 @@ class Daemon(HyperZone):
     # the compositor on every keystroke.
 
     def cmd_drag_start(self, addr, kind):
+        """A Super+drag began. The intent STARTS AT WHAT THE WINDOW ALREADY IS —
+        free-floating (amber) windows start on the float side, tiled ones and grid
+        windows on the snap side — so the border never changes just because a drag
+        began, and Ctrl visibly flips it from there. `kind == "flip"` (the drag was
+        started with Ctrl already held) starts on the other side instead."""
         c = self.client(addr)
         if not c:
             return
+        detached = addr in self.detached
+        intent = "float" if detached else "snap"
+        if kind == "flip":
+            intent = "snap" if intent == "float" else "float"
         self.drag = {
             "addr": addr,
-            "intent": "float" if kind == "float" else "snap",
+            "intent": intent,
             "deadline": time.time() + DRAG_MAX_S,
             "pulled": False,                       # taken out of the grid by us
             "carry": None,                         # (dx, dy) once WE drag it
@@ -3715,14 +3724,14 @@ class Daemon(HyperZone):
                                                     # floating only because WE float our
                                                     # tiles, so a snap drop on an
                                                     # unmanaged screen means DOCK it
-            "was_detached": addr in self.detached,  # amber is for HZ-DETACHED windows;
-                                                    # a merely-floating one keeps its
-                                                    # normal border on a snap drag
+            "was_detached": detached,               # we had floated it free (amber): a
+                                                    # snap drop is a deliberate "put it
+                                                    # back into tiling"
         }
-        if self.drag["intent"] == "float":
+        if intent == "float":
             self._drag_pull()      # grid windows pop free at the grab
         self._paint_intent()
-        log("drag-start", addr, "->", self.drag["intent"])
+        log("drag-start", addr, "->", intent, "(was floating: %s)" % detached)
 
     def cmd_drag_toggle(self):
         """Ctrl pressed during a drag: flip the drop between snap and float. The
@@ -3793,20 +3802,14 @@ class Daemon(HyperZone):
         d["pulled"] = True
 
     def _paint_intent(self):
-        """Border = what the drop will do: amber -> ends up HZ-detached, managed
-        colour -> ends up snapped/tiled. Snap on an unmanaged screen restores the
-        window's ORIGINAL border: amber only if it was detached before the drag —
-        a merely-floating window being moved keeps its normal colour."""
+        """Border = the armed side of the toggle, always: amber -> it will end up
+        free-floating, normal colour -> it will end up snapped/tiled. Nothing else
+        feeds into it, so every Ctrl press flips the colour. (paint() only repaints
+        windows we have painted before, so a window HyperZone has never touched —
+        an app's own dialog, say — still shows no colour change at all.)"""
         d = self.drag
-        if not d:
-            return
-        c = self.client(d["addr"])
-        if d["intent"] == "float":
-            self.paint(d["addr"], True)
-        elif c and self.managed_monitor_for(c):
-            self.paint(d["addr"], False)
-        else:
-            self.paint(d["addr"], d["was_detached"])
+        if d:
+            self.paint(d["addr"], d["intent"] == "float")
 
     def cmd_drag_drop(self):
         d = self.drag
@@ -3839,12 +3842,14 @@ class Daemon(HyperZone):
             self._snap_into(addr, mon)
             self.verify_at = now + VERIFY_AFTER_CMD
             return
-        # Unmanaged screen: snap means "put it back the way it was". A window that
-        # came out of a ZONE (from_grid), or one we found tiled when we took the
-        # drag over (carry_tiled), docks natively — that is the state it had. Any
-        # other window is one Hyprland was dragging on its own terms: it has already
-        # left it floating (or re-tiled it) exactly as it found it, so hands off.
-        if d["from_grid"] or d["carry_tiled"]:
+        # Unmanaged screen. Snap = "this window should be tiled", so it docks
+        # natively — for a window that came out of a ZONE (from_grid), one we had
+        # floated free (was_detached: snapping it is the deliberate way back), and
+        # one Hyprland had tiled before the drag (carry_tiled). Anything else is a
+        # window HyperZone has never managed — an app's own floating dialog being
+        # moved around — and Hyprland has already left it exactly as it found it:
+        # hands off, no float toggling, no repaint.
+        if d["from_grid"] or d["was_detached"] or d["carry_tiled"]:
             if c.get("floating"):
                 hbatch(['hl.dsp.window.float({action="disable", window="address:%s"})'
                         % addr])
@@ -3853,14 +3858,8 @@ class Daemon(HyperZone):
                     # float geometry; flag it so the first Super+T here floats it at its
                     # real docked size instead (see unmanage_float_reset/cmd_toggle_float)
                     self.was_managed.add(addr)
-            self.detached.discard(addr)
-            self.paint(addr, False)
-        elif d["was_detached"]:
-            self.detached.add(addr)
-            self.paint(addr, True)
-        else:
-            self.detached.discard(addr)   # undo a mid-drag float flirt
-            self.paint(addr, False)       # no-op unless we painted it this drag
+        self.detached.discard(addr)
+        self.paint(addr, False)           # no-op unless we have painted it before
         self.save()
 
     def _drag_watch(self):
