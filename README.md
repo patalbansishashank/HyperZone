@@ -68,29 +68,33 @@ hl.bind(mainMod .. " + CTRL + left", hl.dsp.exec_cmd(hz .. " move left"))   -- +
 -- (managed or not) without the window being re-slotted out from under the cursor.
 -- Hyprland ends a drag on EVERY key event and only a PRESS bind can restart one,
 -- so each modifier press takes the drag straight back in the same input event.
+-- (dispatchers are not callable from a Lua callback — hl.dispatch() fires them)
 local hzDragging, hzMods = false, {}
 local hzGrab = hl.dsp.window.drag()
 local hzDrop = hl.dsp.exec_cmd(hz .. " drag-drop")
 hl.bind("mouse:272", function()             -- fires whatever mods are still held,
-    if hzDragging then hzDragging = false; hzDrop() end   -- so a drop is never lost
+    if hzDragging then hzDragging = false; hl.dispatch(hzDrop) end  -- drop never lost
 end, { release = true, ignore_mods = true, non_consuming = true })
 local dragCombos = { [""] = "snap", [" + CTRL"] = "float",
                      [" + SHIFT"] = "tile", [" + CTRL + SHIFT"] = "both" }
 for mods, intent in pairs(dragCombos) do
     local hzStart = hl.dsp.exec_cmd(hz .. " drag-start " .. intent)
     hl.bind(mainMod .. mods .. " + mouse:272", hl.dsp.window.drag(), { mouse = true })
-    hl.bind(mainMod .. mods .. " + mouse:272", function() hzDragging = true; hzStart() end)
+    hl.bind(mainMod .. mods .. " + mouse:272",
+            function() hzDragging = true; hl.dispatch(hzStart) end)
     for key, which in pairs({ Control_L = "ctrl", Control_R = "ctrl",
                               Shift_L = "shift",  Shift_R = "shift" }) do
         local hzDown = hl.dsp.exec_cmd(hz .. " drag-mod " .. which .. "-down")
         local hzUp   = hl.dsp.exec_cmd(hz .. " drag-mod " .. which .. "-up")
         hl.bind(mainMod .. mods .. " + " .. key, function()
-            if hzDragging and not hzMods[key] then hzGrab(); hzDown() end
+            if hzDragging and not hzMods[key] then
+                hl.dispatch(hzGrab); hl.dispatch(hzDown)   -- take the drag back
+            end
             hzMods[key] = true
         end, { non_consuming = true })
         hl.bind(mainMod .. mods .. " + " .. key, function()
             hzMods[key] = false
-            if hzDragging then hzUp() end
+            if hzDragging then hl.dispatch(hzUp) end
         end, { release = true, non_consuming = true })
     end
 end
