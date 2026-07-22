@@ -233,7 +233,10 @@ KEYBIND_LUA = {
     "close-window": "hl.dsp.window.close()",
     "kill-window": "hl.dsp.window.kill()",
     "fullscreen": "hl.dsp.window.fullscreen()",
-    "toggle-group": 'hl.dsp.exec_cmd("hyprctl dispatch togglegroup")',
+    # native dispatcher, not `hyprctl dispatch togglegroup`: this build parses a
+    # dispatch argument as Lua, so the legacy name errors out ("expected a
+    # dispatcher") and the bind silently did nothing.
+    "toggle-group": "hl.dsp.group.toggle()",
     "tows-special": 'hl.dsp.window.move({ workspace = "special:magic" })',
 }
 for _i in range(1, 11):      # send the window to workspace 1..10
@@ -2430,7 +2433,8 @@ class Daemon(HyperZone):
             return bool(m) and m.group(1) in _KB_VERBS
         if "hl.dsp.window.close(" in s or "hl.dsp.window.kill(" in s:
             return True
-        if "hl.dsp.window.fullscreen(" in s or "togglegroup" in s:
+        if "hl.dsp.window.fullscreen(" in s or "togglegroup" in s \
+                or "hl.dsp.group.toggle(" in s:
             return True
         # send-to-workspace: window.move({workspace=..}) — the DIRECTIONAL window.move
         # binds say direction=, and the workspace-FOCUS binds are hl.dsp.focus, so
@@ -2453,6 +2457,11 @@ class Daemon(HyperZone):
             for combo in list(getattr(self, "active_binds", {})):
                 self._heval('hl.unbind("%s")' % combo)
             self.active_binds = {}
+            # the gesture too: recording it means holding the modifier and clicking,
+            # which would otherwise start a drag instead of reaching the recorder
+            for combo in list(getattr(self, "active_gesture", [])):
+                self._heval('hl.unbind("%s")' % combo)
+            self.active_gesture = None
             self.capture_resume_at = time.time() + CAPTURE_MODE_TIMEOUT
         else:
             self.capture_resume_at = None

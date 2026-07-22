@@ -107,10 +107,10 @@ ColumnLayout {
     { title: "Actions", desc: "Re-tile re-snaps windows into their zones · Rearrange is a hard reset that also reclaims floated windows",
       items: [{ id: "toggle-float", label: "Toggle float" }, { id: "rearrange", label: "Rearrange all" },
               { id: "retile", label: "Re-tile / re-snap" }] },
-    { title: "Mouse gesture", kind: "gesture",
-      desc: "Drag a window with the mouse. What letting go does is a two-way toggle you flip mid-drag, and the window's border shows which side is armed: amber = it will be left free-floating where you drop it, normal colour = it will be snapped into the zone under the cursor (or back into tiling on an unmanaged screen). The toggle starts on the side the window is already on, and holding the toggle key as you grab starts on the other side",
-      items: [{ id: "drag-window", label: "Drag a window" },
-              { id: "drag-toggle", label: "Toggle the drop" }] },
+    { title: "Mouse gesture",
+      desc: "Drag a window with the mouse, and flip mid-drag what letting go will do — the border shows which side is armed: amber = left free-floating where you drop it, normal = snapped into the zone under the cursor (back into tiling on an unmanaged screen). It starts on the side the window is already on, so a drag changes nothing by itself; holding the toggle key as you grab starts on the other side",
+      items: [{ id: "drag-window", label: "Drag a window", mode: "mouse" },
+              { id: "drag-toggle", label: "Toggle the drop", mode: "modifier" }] },
   ]
   readonly property var defaultKeybinds: ({
     "focus-left": ["SUPER + left", "SUPER + H"], "focus-right": ["SUPER + right", "SUPER + L"],
@@ -569,16 +569,17 @@ ColumnLayout {
           }
 
           Repeater {
-            model: group.kind === "gesture" ? [] : group.items
+            model: group.items
             delegate: KeybindRecorder {
               Layout.fillWidth: true
               actId: modelData.id
               label: modelData.label
+              // the mouse gesture records differently (a click / a bare modifier)
+              // and holds exactly one binding — otherwise an identical row
+              mode: modelData.mode || "chord"
+              maxKeybinds: modelData.mode ? 1 : 3
             }
           }
-          // The mouse gesture is picked, not recorded: the recorder captures key
-          // chords, and these two are a mouse button and a bare modifier.
-          GestureEditor { visible: group.kind === "gesture"; Layout.fillWidth: true }
         }
       }
 
@@ -721,64 +722,6 @@ ColumnLayout {
     }
   }
 
-  // ======================= inline sub-editor: mouse gesture =======================
-  // Two pickers instead of a recorder: the drag binding is <modifier> + <button>,
-  // and the toggle is a bare modifier — neither is a chord the recorder can capture.
-  // Both are stored as ordinary keybind entries, so they travel with the rest of the
-  // config; the daemon generates the gesture's binds from them (register_gesture).
-  component GestureEditor: ColumnLayout {
-    id: gest
-    spacing: Style.marginXS
-    readonly property var dragParts: {
-      root.rev
-      var c = String((root.combosOf("drag-window") || [])[0] || "SUPER + mouse:272")
-      var p = c.split("+").map(function (s) { return s.trim() })
-      return { mod: p.slice(0, -1).join(" + ").toUpperCase() || "SUPER",
-               button: (p[p.length - 1] || "mouse:272").toLowerCase() }
-    }
-    readonly property string toggleMod: {
-      root.rev
-      return String((root.combosOf("drag-toggle") || [])[0] || "CTRL").trim().toUpperCase()
-    }
-    function setDrag(mod, button) { root.setCombos("drag-window", [mod + " + " + button]) }
-
-    RowLayout {
-      Layout.fillWidth: true; spacing: Style.marginM
-      NComboBox {
-        label: "Hold"; minimumWidth: 170
-        model: [{ key: "SUPER", name: "Super" }, { key: "ALT", name: "Alt" },
-                { key: "SUPER + SHIFT", name: "Super + Shift" },
-                { key: "ALT + SHIFT", name: "Alt + Shift" }]
-        currentKey: gest.dragParts.mod
-        onSelected: (key) => gest.setDrag(key, gest.dragParts.button)
-      }
-      NComboBox {
-        label: "and drag with"; minimumWidth: 170
-        model: [{ key: "mouse:272", name: "Left button" },
-                { key: "mouse:274", name: "Middle button" },
-                { key: "mouse:273", name: "Right button" }]
-        currentKey: gest.dragParts.button
-        onSelected: (key) => gest.setDrag(gest.dragParts.mod, key)
-      }
-      NComboBox {
-        label: "Toggle the drop with"; minimumWidth: 150
-        model: [{ key: "CTRL", name: "Ctrl" }, { key: "ALT", name: "Alt" },
-                { key: "SHIFT", name: "Shift" }]
-        currentKey: gest.toggleMod
-        onSelected: (key) => root.setCombos("drag-toggle", [key])
-      }
-      Item { Layout.fillWidth: true }
-    }
-    NText {
-      Layout.fillWidth: true; wrapMode: Text.WordWrap
-      pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
-      text: "Right button is Hyprland's resize drag by default — picking it here will fight that. " +
-            "The toggle key must not be one you hold to drag."
-      visible: gest.dragParts.button === "mouse:273"
-               || gest.dragParts.mod.indexOf(gest.toggleMod) !== -1
-    }
-  }
-
   // ======================= inline sub-editor: keybind recorder =======================
   // One row per action: existing combos as removable pills + a "Record" pill that
   // captures a pressed chord. While recording we ask the daemon to suspend its live
@@ -789,6 +732,13 @@ ColumnLayout {
     property string actId: ""
     property string label: ""
     property int maxKeybinds: 3
+    // "chord" records a normal shortcut. The mouse gesture needs the other two:
+    // "mouse" records <modifiers> + a mouse button, "modifier" records a bare
+    // modifier (the key that toggles the drop mid-drag) — neither is a chord.
+    property string mode: "chord"
+    readonly property string prompt: mode === "mouse" ? "Hold the modifier and click here…"
+                                     : mode === "modifier" ? "Press a modifier…  (Esc cancels)"
+                                     : "Press keys…  (Esc cancels)"
     readonly property var combos: (root.rev, root.combosOf(actId))
     readonly property bool recording: root.kbRecording === rec.actId
     spacing: Style.marginM
@@ -814,16 +764,47 @@ ColumnLayout {
       var t = String(text || "").trim()
       return t.length === 1 ? t.toUpperCase() : ""
     }
-    function comboFromEvent(e) {
+    function modsOf(modifiers) {
       var parts = []
-      if (e.modifiers & Qt.MetaModifier) parts.push("SUPER")
-      if (e.modifiers & Qt.ControlModifier) parts.push("CTRL")
-      if (e.modifiers & Qt.AltModifier) parts.push("ALT")
-      if (e.modifiers & Qt.ShiftModifier) parts.push("SHIFT")
+      if (modifiers & Qt.MetaModifier) parts.push("SUPER")
+      if (modifiers & Qt.ControlModifier) parts.push("CTRL")
+      if (modifiers & Qt.AltModifier) parts.push("ALT")
+      if (modifiers & Qt.ShiftModifier) parts.push("SHIFT")
+      return parts
+    }
+    function comboFromEvent(e) {
+      var parts = rec.modsOf(e.modifiers)
       var k = rec.keyName(e.key, e.text)
       if (!k) return ""
       parts.push(k)
       return parts.join(" + ")
+    }
+    // a bare modifier, for the "toggle the drop" key
+    function modifierName(key) {
+      switch (key) {
+      case Qt.Key_Control: return "CTRL"
+      case Qt.Key_Alt: return "ALT"
+      case Qt.Key_Shift: return "SHIFT"
+      case Qt.Key_Meta:
+      case Qt.Key_Super_L:
+      case Qt.Key_Super_R: return "SUPER"
+      }
+      return ""
+    }
+    // <modifiers> + mouse:NNN — Hyprland numbers buttons from libinput's BTN_LEFT
+    function mouseCombo(button, modifiers) {
+      var mods = rec.modsOf(modifiers)
+      var n = button === Qt.RightButton ? 273 : button === Qt.MiddleButton ? 274 : 272
+      if (!mods.length) return ""          // a bare click is not a gesture
+      mods.push("mouse:" + n)
+      return mods.join(" + ")
+    }
+    // one binding replaces the last one for the gesture rows: it is a single setting
+    function record(combo) {
+      if (!combo) return
+      if (rec.maxKeybinds === 1) root.setCombos(rec.actId, [combo])
+      else root.addCombo(rec.actId, combo)
+      rec.stopRec()
     }
     function startRec() {
       root.kbRecording = rec.actId
@@ -881,14 +862,27 @@ ColumnLayout {
             pointSize: Style.fontSizeM
           }
           NText {
-            text: rec.recording ? "Press keys…  (Esc cancels)" : "Record"
+            text: rec.recording ? rec.prompt : "Record"
             pointSize: Style.fontSizeS
             color: rec.recording ? Color.mOnSecondary : Color.mOnSurfaceVariant
           }
         }
         MouseArea {
           anchors.fill: parent; cursorShape: Qt.PointingHandCursor
-          onClicked: rec.recording ? rec.stopRec() : rec.startRec()
+          acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
+          // In mouse mode the pill IS the capture target: hold the modifier and
+          // click it. (The daemon suspends its binds while recording, so Super+click
+          // reaches us here instead of starting a drag.)
+          onPressed: function (e) {
+            if (rec.recording && rec.mode === "mouse") {
+              rec.record(rec.mouseCombo(e.button, e.modifiers))
+              e.accepted = true
+            }
+          }
+          onClicked: function (e) {
+            if (rec.recording && rec.mode === "mouse") return
+            rec.recording ? rec.stopRec() : rec.startRec()
+          }
         }
       }
       // hidden key sink: grabs focus while recording, captures the chord
@@ -898,12 +892,13 @@ ColumnLayout {
         Keys.onPressed: function (e) {
           if (!rec.recording) return
           if (e.key === Qt.Key_Escape) { rec.stopRec(); e.accepted = true; return }
-          if (e.key === Qt.Key_Shift || e.key === Qt.Key_Control || e.key === Qt.Key_Alt
-              || e.key === Qt.Key_Meta || e.key === Qt.Key_Super_L || e.key === Qt.Key_Super_R) {
-            e.accepted = true; return   // wait for a real key
+          var mod = rec.modifierName(e.key)
+          if (mod) {                    // a modifier: the answer itself, or wait for a key
+            if (rec.mode === "modifier") rec.record(mod)
+            e.accepted = true; return
           }
-          var combo = rec.comboFromEvent(e)
-          if (combo) { root.addCombo(rec.actId, combo); rec.stopRec() }
+          if (rec.mode !== "chord") { e.accepted = true; return }   // keys are not a gesture
+          rec.record(rec.comboFromEvent(e))
           e.accepted = true
         }
       }
