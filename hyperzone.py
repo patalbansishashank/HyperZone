@@ -1420,6 +1420,14 @@ class HyperZone:
                 return mon
         return None
 
+    def in_flight(self, addr):
+        """True while addr is the window of a live Super+drag session. Such a
+        window is glued to the cursor and belongs to the user until they let go:
+        nothing may re-slot it, re-anchor it or change its floating state until
+        the drop decides (see cmd_drag_drop). Every reaction is DEFERRED, not
+        cancelled — the drop replays whatever bookkeeping was skipped."""
+        return self.drag is not None and self.drag["addr"] == addr
+
     # -- window metadata --
     def client(self, addr):
         for c in (hjson("clients") or []):
@@ -1636,8 +1644,8 @@ class HyperZone:
             for zi, lf, (rx, ry, rw, rh) in mon.leaves():
                 addr = lf["win"]
                 c = clients.get(addr)
-                if not c:
-                    continue
+                if not c or self.in_flight(addr):
+                    continue    # mid-drag: re-anchoring would snap it off the cursor
                 cls = c.get("class") or ""
                 gx, gy = mon.ox + rx, mon.oy + ry
                 tw, th = self.want_size(cls, rw, rh)     # what we commanded
@@ -1803,6 +1811,8 @@ class HyperZone:
         exprs, repaint = [], []
         for zi, lf, (rx, ry, rw, rh) in mon.leaves():
             addr = lf["win"]
+            if self.in_flight(addr):
+                continue        # under the cursor: keep its zone reserved, hands off
             gx, gy = mon.ox + rx, mon.oy + ry
             c = clients.get(addr)
             if c and c.get("fullscreen"):
@@ -2924,6 +2934,14 @@ class Daemon(HyperZone):
     def on_moved(self, addr):
         if addr in self.detached:
             return
+        if self.in_flight(addr):
+            # Mid-drag monitor crossing. Reacting here is what made a managed
+            # window teleport the instant it touched an unmanaged screen: we
+            # un-floated it (unmanage_float_reset) and Hyprland immediately docked
+            # it into that screen's native layout, out from under the cursor. The
+            # crossing is not a decision — the drop is. cmd_drag_drop re-reads the
+            # monitor the window actually landed on and does this work then.
+            return
         c = self.client(addr)
         cur = self.managed_monitor_for(c)
         prev = self.mon_of_addr(addr)
@@ -3681,6 +3699,11 @@ class Daemon(HyperZone):
             "deadline": time.time() + DRAG_MAX_S,
             "pulled": False,                       # taken out of grid / floated by us
             "was_floating": bool(c.get("floating")),
+            "from_grid": self.mon_of_addr(addr) is not None,  # came out of a zone: it is
+                                                    # floating only because WE float our
+                                                    # tiles, so "restore what it was" on
+                                                    # an unmanaged screen means DOCK it
+
             "was_detached": addr in self.detached,  # amber is for HZ-DETACHED windows;
                                                     # a merely-floating one keeps its
                                                     # normal border on a snap drag
@@ -3760,16 +3783,16 @@ class Daemon(HyperZone):
         log("drag-drop", addr, "intent", intent)
         if not c:
             return
+        mon = self.managed_monitor_for(c)      # where it actually LANDED
+        old = self.mon_of_addr(addr)           # whose grid still holds its slot
+        if old is not None and (old is not mon or intent == "float"):
+            self.remove(addr, old)    # deferred crossing (see on_moved) / popped free
         if intent == "float":
-            mon = self.mon_of_addr(addr)
-            if mon:
-                self.remove(addr, mon)
             self._float_in_place(addr)
             self.detached.add(addr)
             self.paint(addr, True)
             self.save()
             return
-        mon = self.managed_monitor_for(c)
         if mon:                       # tile == snap on a managed screen: into the grid
             self._snap_into(addr, mon)
             self.verify_at = now + VERIFY_AFTER_CMD
@@ -3777,7 +3800,10 @@ class Daemon(HyperZone):
         # Unmanaged screen: tile forces native tiling; snap restores the window's
         # original state (a pulled-then-reverted drag must put a tiled window back,
         # and a merely-floating window that was never HZ-detached stays pristine).
-        want_float = d["was_floating"] if intent == "snap" else False
+        # A window that came out of a ZONE has no original state here — it was
+        # floating only because we float our tiles — so it docks natively, which is
+        # what crossing onto an unmanaged screen has always done, now at the drop.
+        want_float = intent == "snap" and d["was_floating"] and not d["from_grid"]
         if want_float:
             if d["was_detached"]:
                 self.detached.add(addr)
@@ -3789,6 +3815,11 @@ class Daemon(HyperZone):
             if c.get("floating"):
                 hbatch(['hl.dsp.window.float({action="disable", window="address:%s"})'
                         % addr])
+                if d["from_grid"]:
+                    # it was floated at a ZONE size and Hyprland remembers that as its
+                    # float geometry; flag it so the first Super+T here floats it at its
+                    # real docked size instead (see unmanage_float_reset/cmd_toggle_float)
+                    self.was_managed.add(addr)
             self.detached.discard(addr)
             self.paint(addr, False)
         self.save()

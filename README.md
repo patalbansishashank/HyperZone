@@ -64,6 +64,8 @@ hl.bind(mainMod .. " + CTRL + left", hl.dsp.exec_cmd(hz .. " move left"))   -- +
 -- Mouse: Super+drag moves a window; the modifiers held at DROP time decide what
 -- happens (switchable mid-drag, border colour = current intent):
 --   Super -> snap into zone | +Ctrl -> leave floating | +Shift -> back to tiling
+-- Nothing is applied until you let go, so a drag can cross any number of screens
+-- (managed or not) without the window being re-slotted out from under the cursor.
 local dragCombos = { [""] = "snap", [" + CTRL"] = "float",
                      [" + SHIFT"] = "tile", [" + CTRL + SHIFT"] = "both" }
 for mods, intent in pairs(dragCombos) do
