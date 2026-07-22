@@ -1869,6 +1869,10 @@ class HyperZone:
                     "detached": sorted(self.detached),
                     "painted": sorted(self.painted),
                     "was_managed": sorted(self.was_managed),
+                    # what the gesture is bound to right now: a fresh daemon has to
+                    # unbind the PREVIOUS instance's binds, or turning the gesture
+                    # off leaves the old ones live in Hyprland (they outlive us)
+                    "gesture_binds": list(getattr(self, "active_gesture", None) or []),
                     "minsize": self.minsize}
             tmp = STATE_PATH + ".tmp"      # write-then-rename: a crash mid-write
             with open(tmp, "w") as f:      # can never leave a corrupt state file
@@ -1898,6 +1902,8 @@ class HyperZone:
         self.detached = set(data.get("detached", [])) & all_valid
         self.painted = set(data.get("painted", [])) & all_valid
         self.was_managed = set(data.get("was_managed", [])) & all_valid
+        if getattr(self, "active_gesture", None) is None:
+            self.active_gesture = data.get("gesture_binds") or None
         try:   # learned app min sizes are per-CLASS, valid across window lifetimes
             self.minsize = {str(k): [int(v[0]), int(v[1])]
                             for k, v in dict(data.get("minsize", {})).items()}
@@ -2290,20 +2296,32 @@ class Daemon(HyperZone):
         """The mouse gesture as (mods, button, toggle) — e.g. (["SUPER"],
         "mouse:272", "CTRL"). Everything is checked against a fixed vocabulary:
         these strings end up inside Lua we hand to Hyprland's `eval`, so a typo in
-        the config file must fall back to the default, never reach the compositor."""
-        def first(action):
-            combos = KEYBINDS.get(action) or DEFAULT_KEYBINDS[action]
-            return (combos[0] if combos else "").strip().upper()
+        the config file must fall back to the default, never reach the compositor.
 
-        parts = [p.strip() for p in first("drag-window").split("+") if p.strip()]
+        CLEARING a binding turns that half OFF, exactly like clearing any other
+        keybind: no drag binding -> (None, None, None), the gesture is not
+        registered at all; no toggle binding -> the drag works but cannot flip
+        mid-drag. (An UNSET entry still means "use the default" — that is the
+        difference between never touching it and deliberately emptying it.)"""
+        def first(action):
+            combos = KEYBINDS.get(action)
+            if combos is None:
+                combos = DEFAULT_KEYBINDS[action]
+            live = [c.strip().upper() for c in combos if c and c.strip()]
+            return live[0] if live else ""
+
+        drag_combo = first("drag-window")
+        if not drag_combo:
+            return None, None, None
+        parts = [p.strip() for p in drag_combo.split("+") if p.strip()]
         mods = [p for p in parts[:-1] if p in GESTURE_MODS]
         button = (parts[-1] if parts else "").lower()
         if button not in GESTURE_BUTTONS or len(mods) != len(parts) - 1 or not mods:
             log("gesture: bad drag binding %r, using the default"
                 % (KEYBINDS.get("drag-window"),))
             mods, button = ["SUPER"], "mouse:272"
-        toggle = first("drag-toggle")
-        if toggle not in GESTURE_TOGGLE_KEYS or toggle in mods:
+        toggle = first("drag-toggle") or None
+        if toggle is not None and (toggle not in GESTURE_TOGGLE_KEYS or toggle in mods):
             log("gesture: bad toggle key %r, using CTRL" % (toggle,))
             toggle = "CTRL" if "CTRL" not in mods else "ALT"
         return mods, button, toggle
@@ -2315,23 +2333,48 @@ class Daemon(HyperZone):
         on press and hands the drag over on release. ignore_mods is what keeps each
         of those firing exactly once per physical press — see the drag session notes."""
         mods, button, toggle = self.gesture_setting()
-        drag = " + ".join(mods + [button])
-        flip = " + ".join(mods + [toggle, button])
-        keys = GESTURE_TOGGLE_KEYS[toggle]
-        combos = [drag, flip, button] + list(keys)
-        if initial or getattr(self, "active_gesture", None) != combos:
-            for c in combos:                  # drop ours / any hyprland.lua leftovers
-                self._heval('hl.unbind("%s")' % c)
-            for expr in self._gesture_exprs(drag, flip, button, keys):
-                self._heval(expr)
-            self.active_gesture = combos
-            log("gesture: %s to drag, %s toggles the drop" % (drag, toggle))
+        drag = flip = None
+        keys = ()
+        combos = []
+        if mods:
+            drag = " + ".join(mods + [button])
+            combos = [drag, button]
+            if toggle:
+                flip = " + ".join(mods + [toggle, button])
+                keys = GESTURE_TOGGLE_KEYS[toggle]
+                combos += [flip] + list(keys)
+        prev = getattr(self, "active_gesture", None)
+        if not initial and prev == combos:
+            return
+        stale = list(prev or [])
+        if initial:
+            stale += self._default_gesture_combos()
+        for c in set(stale + combos):     # the OLD combos too: a changed modifier (or
+            self._heval('hl.unbind("%s")' % c)   # a cleared one) must leave nothing behind
+        for expr in self._gesture_exprs(drag, flip, button, keys):
+            self._heval(expr)
+        self.active_gesture = combos
+        log("gesture: %s" % ("%s to drag, %s toggles the drop"
+                             % (drag, toggle or "nothing") if mods else "off (unbound)"))
+
+    @staticmethod
+    def _default_gesture_combos():
+        """Every combo the out-of-the-box gesture uses — unbound on takeover so a
+        previous daemon's (or hyprland.lua's) binds cannot survive a change."""
+        parts = [p.strip().upper() for p in DEFAULT_KEYBINDS["drag-window"][0].split("+")]
+        mods, button = parts[:-1], parts[-1].lower()
+        toggle = DEFAULT_KEYBINDS["drag-toggle"][0].strip().upper()
+        return [" + ".join(mods + [button]), button,
+                " + ".join(mods + [toggle, button])] + list(GESTURE_TOGGLE_KEYS[toggle])
 
     @staticmethod
     def _gesture_exprs(drag, flip, button, keys):
         """The Lua behind the gesture. Kept as one dispatcher table in a global so a
         re-register replaces it wholesale, and so every callback body stays trivial —
         a callback that throws would surface as a config error on screen."""
+        if not drag:
+            return []                     # the user cleared it: the gesture is off
+
         def cmd(name):
             return 'hl.dsp.exec_cmd("%s %s")' % (HZCTL_CMD, name)
         exprs = [
@@ -2341,12 +2384,16 @@ class Daemon(HyperZone):
                                          cmd("drag-drop")),
             'hl.bind("%s", hl.dsp.window.drag(), { mouse = true })' % drag,
             'hl.bind("%s", function() HZ_DRAG.on = true; hl.dispatch(HZ_DRAG.start) end)' % drag,
-            'hl.bind("%s", hl.dsp.window.drag(), { mouse = true })' % flip,
-            'hl.bind("%s", function() HZ_DRAG.on = true; hl.dispatch(HZ_DRAG.flip) end)' % flip,
             'hl.bind("%s", function() if HZ_DRAG.on then HZ_DRAG.on = false; '
             'hl.dispatch(HZ_DRAG.drop) end end, '
             '{ release = true, ignore_mods = true, non_consuming = true })' % button,
         ]
+        if flip:                          # grabbing with the toggle already held
+            exprs += [
+                'hl.bind("%s", hl.dsp.window.drag(), { mouse = true })' % flip,
+                'hl.bind("%s", function() HZ_DRAG.on = true; '
+                'hl.dispatch(HZ_DRAG.flip) end)' % flip,
+            ]
         for key in keys:
             exprs.append('hl.bind("%s", function() if HZ_DRAG.on then '
                          'hl.dispatch(HZ_DRAG.toggle) end end, '

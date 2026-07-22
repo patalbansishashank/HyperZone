@@ -108,7 +108,7 @@ ColumnLayout {
       items: [{ id: "toggle-float", label: "Toggle float" }, { id: "rearrange", label: "Rearrange all" },
               { id: "retile", label: "Re-tile / re-snap" }] },
     { title: "Mouse gesture",
-      desc: "Drag a window with the mouse, and flip mid-drag what letting go will do — the border shows which side is armed: amber = left free-floating where you drop it, normal = snapped into the zone under the cursor (back into tiling on an unmanaged screen). It starts on the side the window is already on, so a drag changes nothing by itself; holding the toggle key as you grab starts on the other side. The left mouse button is fixed — Record sets the modifier you hold with it, and the modifier that toggles",
+      desc: "Drag a window with the mouse, and flip mid-drag what letting go will do — the border shows which side is armed: amber = left free-floating where you drop it, normal = snapped into the zone under the cursor (back into tiling on an unmanaged screen). It starts on the side the window is already on, so a drag changes nothing by itself; holding the toggle key as you grab starts on the other side. The left mouse button itself is fixed, so Record sets the modifier you hold with it; remove a binding to switch that half off",
       items: [{ id: "drag-window", label: "Drag a window", mode: "drag" },
               { id: "drag-toggle", label: "Toggle the drop", mode: "modifier" }] },
   ]
@@ -737,6 +737,8 @@ ColumnLayout {
     // "modifier" records the bare modifier that toggles the drop mid-drag.
     property string mode: "chord"
     readonly property string suffix: mode === "drag" ? " + mouse:272" : ""
+    // shown BESIDE the pill, never inside it: this half cannot be recorded away
+    readonly property string fixedPart: mode === "drag" ? "+ Left click" : ""
     readonly property string prompt: mode === "chord" ? "Press keys…  (Esc cancels)"
                                      : "Press the modifier…  (Esc cancels)"
     readonly property var combos: (root.rev, root.combosOf(actId))
@@ -792,11 +794,14 @@ ColumnLayout {
       }
       return ""
     }
-    // Hyprland spells mouse buttons the way libinput numbers them; say it in English
+    // The pill holds the editable half only — the fixed button is rendered next to
+    // it (fixedPart), so nothing in a pill is ever something you cannot change.
     function prettyCombo(combo) {
-      return String(combo).replace("mouse:272", "Left click")
-                          .replace("mouse:273", "Right click")
-                          .replace("mouse:274", "Middle click")
+      var c = String(combo)
+      if (rec.suffix && c.slice(-rec.suffix.length) === rec.suffix)
+        return c.slice(0, -rec.suffix.length)
+      return c.replace("mouse:272", "Left click").replace("mouse:273", "Right click")
+              .replace("mouse:274", "Middle click")
     }
     // every modifier held at this moment, including the one just pressed
     function modifiersOf(e) {
@@ -847,11 +852,21 @@ ColumnLayout {
             anchors.centerIn: parent; spacing: Style.marginXS
             NText { text: rec.prettyCombo(modelData); pointSize: Style.fontSizeS }
             NIconButton {
-              visible: rec.maxKeybinds > 1     // a single-binding row is replaced, not cleared
               icon: "close"; baseSize: Style.baseWidgetSize * 0.55; tooltipText: "Remove"
               onClicked: root.removeCombo(rec.actId, modelData)
             }
           }
+        }
+      }
+      Item {                             // the half you cannot change: no pill, no X
+        visible: rec.fixedPart !== "" && rec.combos.length > 0
+        implicitWidth: fixedText.implicitWidth
+        implicitHeight: Style.baseWidgetSize * 0.55 + Style.marginXS * 2
+        NText {
+          id: fixedText
+          anchors.centerIn: parent
+          text: rec.fixedPart
+          pointSize: Style.fontSizeS; color: Color.mOnSurfaceVariant
         }
       }
       Rectangle {
