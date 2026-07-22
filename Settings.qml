@@ -107,6 +107,10 @@ ColumnLayout {
     { title: "Actions", desc: "Re-tile re-snaps windows into their zones · Rearrange is a hard reset that also reclaims floated windows",
       items: [{ id: "toggle-float", label: "Toggle float" }, { id: "rearrange", label: "Rearrange all" },
               { id: "retile", label: "Re-tile / re-snap" }] },
+    { title: "Mouse gesture", kind: "gesture",
+      desc: "Drag a window with the mouse. What letting go does is a two-way toggle you flip mid-drag, and the window's border shows which side is armed: amber = it will be left free-floating where you drop it, normal colour = it will be snapped into the zone under the cursor (or back into tiling on an unmanaged screen). The toggle starts on the side the window is already on, and holding the toggle key as you grab starts on the other side",
+      items: [{ id: "drag-window", label: "Drag a window" },
+              { id: "drag-toggle", label: "Toggle the drop" }] },
   ]
   readonly property var defaultKeybinds: ({
     "focus-left": ["SUPER + left", "SUPER + H"], "focus-right": ["SUPER + right", "SUPER + L"],
@@ -128,7 +132,8 @@ ColumnLayout {
     "tows-5": ["SUPER + SHIFT + 5"], "tows-6": ["SUPER + SHIFT + 6"],
     "tows-7": ["SUPER + SHIFT + 7"], "tows-8": ["SUPER + SHIFT + 8"],
     "tows-9": ["SUPER + SHIFT + 9"], "tows-10": ["SUPER + SHIFT + 0", "SUPER + CTRL + End"],
-    "tows-special": ["SUPER + SHIFT + S"]
+    "tows-special": ["SUPER + SHIFT + S"],
+    "drag-window": ["SUPER + mouse:272"], "drag-toggle": ["CTRL"]
   })
   function combosOf(id) { var k = edit.keybinds || {}; return (k[id] || []).slice() }
   function setCombos(id, arr) {
@@ -564,13 +569,16 @@ ColumnLayout {
           }
 
           Repeater {
-            model: group.items
+            model: group.kind === "gesture" ? [] : group.items
             delegate: KeybindRecorder {
               Layout.fillWidth: true
               actId: modelData.id
               label: modelData.label
             }
           }
+          // The mouse gesture is picked, not recorded: the recorder captures key
+          // chords, and these two are a mouse button and a bare modifier.
+          GestureEditor { visible: group.kind === "gesture"; Layout.fillWidth: true }
         }
       }
 
@@ -710,6 +718,64 @@ ColumnLayout {
       }
       NButton { text: "Keep"; onClicked: root.hz.request("confirm_monitor_layout", {}) }
       NButton { text: "Revert"; outlined: true; onClicked: root.hz.request("revert_monitor_layout", {}) }
+    }
+  }
+
+  // ======================= inline sub-editor: mouse gesture =======================
+  // Two pickers instead of a recorder: the drag binding is <modifier> + <button>,
+  // and the toggle is a bare modifier — neither is a chord the recorder can capture.
+  // Both are stored as ordinary keybind entries, so they travel with the rest of the
+  // config; the daemon generates the gesture's binds from them (register_gesture).
+  component GestureEditor: ColumnLayout {
+    id: gest
+    spacing: Style.marginXS
+    readonly property var dragParts: {
+      root.rev
+      var c = String((root.combosOf("drag-window") || [])[0] || "SUPER + mouse:272")
+      var p = c.split("+").map(function (s) { return s.trim() })
+      return { mod: p.slice(0, -1).join(" + ").toUpperCase() || "SUPER",
+               button: (p[p.length - 1] || "mouse:272").toLowerCase() }
+    }
+    readonly property string toggleMod: {
+      root.rev
+      return String((root.combosOf("drag-toggle") || [])[0] || "CTRL").trim().toUpperCase()
+    }
+    function setDrag(mod, button) { root.setCombos("drag-window", [mod + " + " + button]) }
+
+    RowLayout {
+      Layout.fillWidth: true; spacing: Style.marginM
+      NComboBox {
+        label: "Hold"; minimumWidth: 170
+        model: [{ key: "SUPER", name: "Super" }, { key: "ALT", name: "Alt" },
+                { key: "SUPER + SHIFT", name: "Super + Shift" },
+                { key: "ALT + SHIFT", name: "Alt + Shift" }]
+        currentKey: gest.dragParts.mod
+        onSelected: (key) => gest.setDrag(key, gest.dragParts.button)
+      }
+      NComboBox {
+        label: "and drag with"; minimumWidth: 170
+        model: [{ key: "mouse:272", name: "Left button" },
+                { key: "mouse:274", name: "Middle button" },
+                { key: "mouse:273", name: "Right button" }]
+        currentKey: gest.dragParts.button
+        onSelected: (key) => gest.setDrag(gest.dragParts.mod, key)
+      }
+      NComboBox {
+        label: "Toggle the drop with"; minimumWidth: 150
+        model: [{ key: "CTRL", name: "Ctrl" }, { key: "ALT", name: "Alt" },
+                { key: "SHIFT", name: "Shift" }]
+        currentKey: gest.toggleMod
+        onSelected: (key) => root.setCombos("drag-toggle", [key])
+      }
+      Item { Layout.fillWidth: true }
+    }
+    NText {
+      Layout.fillWidth: true; wrapMode: Text.WordWrap
+      pointSize: Style.fontSizeXS; color: Color.mOnSurfaceVariant
+      text: "Right button is Hyprland's resize drag by default — picking it here will fight that. " +
+            "The toggle key must not be one you hold to drag."
+      visible: gest.dragParts.button === "mouse:273"
+               || gest.dragParts.mod.indexOf(gest.toggleMod) !== -1
     }
   }
 

@@ -238,7 +238,7 @@ KEYBIND_LUA = {
 }
 for _i in range(1, 11):      # send the window to workspace 1..10
     KEYBIND_LUA["tows-%d" % _i] = "hl.dsp.window.move({ workspace = %d })" % _i
-KEYBIND_ACTIONS = set(KEYBIND_CMDS) | set(KEYBIND_LUA)
+KEYBIND_ACTIONS = set(KEYBIND_CMDS) | set(KEYBIND_LUA) | {"drag-window", "drag-toggle"}
 DEFAULT_KEYBINDS = {
     "focus-left": ["SUPER + left", "SUPER + H"],
     "focus-right": ["SUPER + right", "SUPER + L"],
@@ -279,6 +279,18 @@ for _i in range(1, 11):
     elif _i == 10:
         _combos.append("SUPER + CTRL + End")
     DEFAULT_KEYBINDS["tows-%d" % _i] = _combos
+# The mouse gesture (see the drag session further down) is not one bind but a small
+# set of them that share a state flag, so it is configured as its two halves — what
+# starts a drag, and what toggles the drop between snap and float mid-drag — and the
+# daemon generates the binds from those (register_gesture).
+GESTURE_ACTIONS = ("drag-window", "drag-toggle")
+DEFAULT_KEYBINDS["drag-window"] = ["SUPER + mouse:272"]
+DEFAULT_KEYBINDS["drag-toggle"] = ["CTRL"]
+GESTURE_MODS = ("SUPER", "CTRL", "ALT", "SHIFT")
+GESTURE_BUTTONS = ("mouse:272", "mouse:273", "mouse:274")
+# keysyms to bind for each toggle modifier — BOTH sides, so it works on either hand
+GESTURE_TOGGLE_KEYS = {"CTRL": ("Control_L", "Control_R"), "ALT": ("Alt_L", "Alt_R"),
+                       "SHIFT": ("Shift_L", "Shift_R"), "SUPER": ("Super_L", "Super_R")}
 # "find my cursor" / screen-share pointer. On the hotkey the plugin overlay draws a
 # sleek arrow that points AT the cursor and FOLLOWS it live. The daemon owns the live
 # part: it polls `cursorpos` (a cheap .socket.sock round-trip) every LOCATE_POLL_S and
@@ -2258,14 +2270,88 @@ class Daemon(HyperZone):
 
     @staticmethod
     def desired_binds():
-        """KEYBINDS flattened to {combo: action}; blanks dropped."""
+        """KEYBINDS flattened to {combo: action}; blanks dropped. The mouse gesture
+        is not in here — it is a set of co-operating binds, see register_gesture."""
         out = {}
         for action, combos in KEYBINDS.items():
+            if action in GESTURE_ACTIONS:
+                continue
             for combo in combos:
                 c = combo.strip()
                 if c:
                     out[c] = action
         return out
+
+    @staticmethod
+    def gesture_setting():
+        """The mouse gesture as (mods, button, toggle) — e.g. (["SUPER"],
+        "mouse:272", "CTRL"). Everything is checked against a fixed vocabulary:
+        these strings end up inside Lua we hand to Hyprland's `eval`, so a typo in
+        the config file must fall back to the default, never reach the compositor."""
+        def first(action):
+            combos = KEYBINDS.get(action) or DEFAULT_KEYBINDS[action]
+            return (combos[0] if combos else "").strip().upper()
+
+        parts = [p.strip() for p in first("drag-window").split("+") if p.strip()]
+        mods = [p for p in parts[:-1] if p in GESTURE_MODS]
+        button = (parts[-1] if parts else "").lower()
+        if button not in GESTURE_BUTTONS or len(mods) != len(parts) - 1 or not mods:
+            log("gesture: bad drag binding %r, using the default"
+                % (KEYBINDS.get("drag-window"),))
+            mods, button = ["SUPER"], "mouse:272"
+        toggle = first("drag-toggle")
+        if toggle not in GESTURE_TOGGLE_KEYS or toggle in mods:
+            log("gesture: bad toggle key %r, using CTRL" % (toggle,))
+            toggle = "CTRL" if "CTRL" not in mods else "ALT"
+        return mods, button, toggle
+
+    def register_gesture(self, initial=False):
+        """(Re)register the drag gesture from its two settings. One bind starts
+        Hyprland's own drag and tells the daemon; one universal release (ignore_mods,
+        so a released SUPER cannot swallow it) ends it; the toggle key flips the drop
+        on press and hands the drag over on release. ignore_mods is what keeps each
+        of those firing exactly once per physical press — see the drag session notes."""
+        mods, button, toggle = self.gesture_setting()
+        drag = " + ".join(mods + [button])
+        flip = " + ".join(mods + [toggle, button])
+        keys = GESTURE_TOGGLE_KEYS[toggle]
+        combos = [drag, flip, button] + list(keys)
+        if initial or getattr(self, "active_gesture", None) != combos:
+            for c in combos:                  # drop ours / any hyprland.lua leftovers
+                self._heval('hl.unbind("%s")' % c)
+            for expr in self._gesture_exprs(drag, flip, button, keys):
+                self._heval(expr)
+            self.active_gesture = combos
+            log("gesture: %s to drag, %s toggles the drop" % (drag, toggle))
+
+    @staticmethod
+    def _gesture_exprs(drag, flip, button, keys):
+        """The Lua behind the gesture. Kept as one dispatcher table in a global so a
+        re-register replaces it wholesale, and so every callback body stays trivial —
+        a callback that throws would surface as a config error on screen."""
+        def cmd(name):
+            return 'hl.dsp.exec_cmd("%s %s")' % (HZCTL_CMD, name)
+        exprs = [
+            'HZ_DRAG = { on = false, start = %s, flip = %s, toggle = %s, '
+            'carry = %s, drop = %s }' % (cmd("drag-start"), cmd("drag-start flip"),
+                                         cmd("drag-toggle"), cmd("drag-carry"),
+                                         cmd("drag-drop")),
+            'hl.bind("%s", hl.dsp.window.drag(), { mouse = true })' % drag,
+            'hl.bind("%s", function() HZ_DRAG.on = true; hl.dispatch(HZ_DRAG.start) end)' % drag,
+            'hl.bind("%s", hl.dsp.window.drag(), { mouse = true })' % flip,
+            'hl.bind("%s", function() HZ_DRAG.on = true; hl.dispatch(HZ_DRAG.flip) end)' % flip,
+            'hl.bind("%s", function() if HZ_DRAG.on then HZ_DRAG.on = false; '
+            'hl.dispatch(HZ_DRAG.drop) end end, '
+            '{ release = true, ignore_mods = true, non_consuming = true })' % button,
+        ]
+        for key in keys:
+            exprs.append('hl.bind("%s", function() if HZ_DRAG.on then '
+                         'hl.dispatch(HZ_DRAG.toggle) end end, '
+                         '{ ignore_mods = true, non_consuming = true })' % key)
+            exprs.append('hl.bind("%s", function() if HZ_DRAG.on then '
+                         'hl.dispatch(HZ_DRAG.carry) end end, '
+                         '{ release = true, ignore_mods = true, non_consuming = true })' % key)
+        return exprs
 
     def register_keybinds(self, initial=False):
         """Reconcile Hyprland's live binds with KEYBINDS. On `initial` (startup) we
@@ -2283,6 +2369,7 @@ class Daemon(HyperZone):
                     self._heval('hl.unbind("%s")' % combo)   # drop hyprland.lua dup
                 self._heval(self._keybind_expr(combo, action))
         self.active_binds = desired
+        self.register_gesture(initial)
 
     def migrate_keybinds(self):
         """Stop hyprland.lua from ALSO binding the keys we now own (else a press fires

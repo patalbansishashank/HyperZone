@@ -61,44 +61,13 @@ local hz = "python3 -S ~/.local/bin/hzctl.py"
 hl.bind(mainMod .. " + T",           hl.dsp.exec_cmd(hz .. " toggle-float"))
 hl.bind(mainMod .. " + SHIFT + T",   hl.dsp.exec_cmd(hz .. " rearrange"))
 hl.bind(mainMod .. " + CTRL + left", hl.dsp.exec_cmd(hz .. " move left"))   -- +right/up/down
--- Mouse: Super+drag moves a window (Hyprland's own drag, untouched). CTRL
--- TOGGLES what letting go will do, and the border colour says which is armed:
---   normal colour -> snap: into the zone under the cursor on a managed screen,
---                    back into native tiling on an unmanaged one
---   amber         -> float: leave it free-floating right where it was dropped
--- The toggle starts at whatever the window already is: a free-floating (amber)
--- window starts on the float side, a tiled one on the snap side, so a drag never
--- changes anything by itself and Ctrl always flips the colour. Holding Ctrl as
--- the drag begins starts on the other side. Nothing is applied until the button
--- comes up, so a drag can cross any number of screens.
---   Hyprland ends a window drag on EVERY key event and only a bind firing on a
--- key PRESS can start one again — a Ctrl tap therefore always ends its own drag
--- on the release, and no bind can undo that. So the first Ctrl event hands the
--- drag to the daemon, which moves the window with the cursor itself until the
--- drop. `ignore_mods` makes each bind fire exactly once per physical press
--- (without it Hyprland re-fires mod-mismatched binds on the release too), and
--- dispatchers are not callable from a Lua callback — hl.dispatch() fires them.
-local hzDragging = false
-local hzStart, hzStartF = hl.dsp.exec_cmd(hz .. " drag-start"),
-                          hl.dsp.exec_cmd(hz .. " drag-start flip")
-local hzToggle, hzCarry = hl.dsp.exec_cmd(hz .. " drag-toggle"),
-                          hl.dsp.exec_cmd(hz .. " drag-carry")
-local hzDrop = hl.dsp.exec_cmd(hz .. " drag-drop")
-hl.bind(mainMod .. " + mouse:272", hl.dsp.window.drag(), { mouse = true })
-hl.bind(mainMod .. " + mouse:272", function() hzDragging = true; hl.dispatch(hzStart) end)
-hl.bind(mainMod .. " + CTRL + mouse:272", hl.dsp.window.drag(), { mouse = true })
-hl.bind(mainMod .. " + CTRL + mouse:272", function() hzDragging = true; hl.dispatch(hzStartF) end)
-hl.bind("mouse:272", function()          -- fires whatever mods are still held, so
-    if hzDragging then hzDragging = false; hl.dispatch(hzDrop) end   -- no lost drop
-end, { release = true, ignore_mods = true, non_consuming = true })
-for _, key in ipairs({ "Control_L", "Control_R" }) do
-    hl.bind(key, function()                      -- press: flip snap <-> float
-        if hzDragging then hl.dispatch(hzToggle) end
-    end, { ignore_mods = true, non_consuming = true })
-    hl.bind(key, function()                      -- release: it just killed the drag
-        if hzDragging then hl.dispatch(hzCarry) end
-    end, { release = true, ignore_mods = true, non_consuming = true })
-end
+-- Mouse: the drag gesture is NOT written here — HyperZone owns it and registers
+-- it from Settings → Keybinds → "Mouse gesture", where the modifier, the mouse
+-- button and the toggle key are all pickable. Super+drag moves a window; CTRL
+-- toggles what letting go does (amber border = leave it free-floating where you
+-- drop it, normal = snap it into the zone under the cursor, or back into native
+-- tiling on an unmanaged screen). The toggle starts on the side the window is
+-- already on, so a drag never changes anything by itself.
 ```
 
 ## The settings UI
@@ -117,6 +86,12 @@ lines** to any split (25/75, 33/66, 50/50…). A reorder list sets the **fill
 order** (top = first) and each row's checkbox marks a zone **subdividable** (it
 splits in two when a second window lands there); a second list orders which
 subdividable zone fills first.
+
+**Keybinds** — every action HyperZone binds, recorded by pressing the shortcut,
+plus the **Mouse gesture**: which modifier + mouse button drags a window, and
+which key toggles the drop between *snap into the zone* and *leave it floating*
+(the border colour tracks the armed side, and the toggle starts on the side the
+window is already on).
 
 **General** — new-window adopt delay, never-tile window classes, floating border
 colors.
