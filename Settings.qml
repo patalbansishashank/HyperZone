@@ -112,6 +112,16 @@ ColumnLayout {
       items: [{ id: "drag-window", label: "Drag a window", mode: "drag" },
               { id: "drag-toggle", label: "Toggle the drop", mode: "modifier" }] },
   ]
+  // Installed extensions each contribute one more group, described by the daemon at
+  // runtime (id, name, description, the actions they registered). The UI knows nothing
+  // about what any of them do — an extension's rows record and clear like every other
+  // row because edit.keybinds already carries its action ids.
+  readonly property var extGroups: (root.hz && root.hz.extensions ? root.hz.extensions : []).map(function (e) {
+    return { title: e.name || e.id,
+             desc: (e.desc ? e.desc + " · " : "") + "from the “" + e.id + "” extension",
+             items: (e.actions || []).map(function (a) { return { id: a.id, label: a.label || a.id } }) }
+  })
+  readonly property var allKeybindGroups: keybindGroups.concat(extGroups)
   readonly property var defaultKeybinds: ({
     "focus-left": ["SUPER + left", "SUPER + H"], "focus-right": ["SUPER + right", "SUPER + L"],
     "focus-up": ["SUPER + up", "SUPER + K"], "focus-down": ["SUPER + down", "SUPER + J"],
@@ -178,9 +188,10 @@ ColumnLayout {
   }
   function removeCombo(id, combo) { setCombos(id, combosOf(id).filter(function (c) { return c !== combo })) }
   function keybindLabel(id) {
-    for (var g = 0; g < keybindGroups.length; g++)
-      for (var i = 0; i < keybindGroups[g].items.length; i++)
-        if (keybindGroups[g].items[i].id === id) return keybindGroups[g].items[i].label
+    var groups = allKeybindGroups
+    for (var g = 0; g < groups.length; g++)
+      for (var i = 0; i < groups[g].items.length; i++)
+        if (groups[g].items[i].id === id) return groups[g].items[i].label
     return id
   }
   function resetKeybinds() { edit.keybinds = JSON.parse(JSON.stringify(defaultKeybinds)); rev++ }
@@ -557,7 +568,7 @@ ColumnLayout {
       }
 
       Repeater {
-        model: root.keybindGroups
+        model: root.allKeybindGroups
         delegate: ColumnLayout {
           Layout.fillWidth: true
           spacing: Style.marginXS

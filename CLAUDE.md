@@ -175,6 +175,39 @@ map ids to hzctl invocations and seed the defaults.
   The daemon is unchanged; "managed" == `enabled && zones>=2`. HyperZone still moves windows/focus
   to/from 1-zone screens; it just doesn't split them.
 
+## Extensions (third-party actions)
+
+`~/.config/hyperzone/extensions/*.py` — each file is an extension, filename = its id.
+`load_extensions()` runs in `main()` **before** `load_user_config()` (its actions must be
+registered before `merge_keybinds`/`validate_config` see a config that binds them).
+- Contract = the `ExtensionAPI` class and nothing else. Bump `EXT_API_VERSION` on a
+  breaking change; a file whose `API_VERSION` disagrees is skipped with a log line.
+- An action registers as `<file>.<name>` (e.g. `flip.horizontal`) and slots into the SAME
+  registries as built-ins (`KEYBIND_ACTIONS`, `DEFAULT_KEYBINDS`, `KEYBINDS`), so keybind
+  registration, config validation and the settings UI need no special case. Dots are
+  illegal in built-in ids, so the namespaces can't collide.
+- Routing: `_keybind_expr` emits `hzctl ext <action id>`; `hzctl` validates that arg by
+  CHARSET (it can't know the registry) and `on_cmd` → `cmd_ext` looks it up. An exception
+  in third-party code is caught and logged — it must never take the tiler down.
+- A load failure rolls back that extension's partial registration, then continues.
+- `ExtensionAPI.suspend(s)` sets `HyperZone.ext_settle`; `on_moved` returns early while
+  it's live. Anything moving windows between monitors wholesale needs it, or the tiler
+  re-adopts each window mid-flight (Hyprland fires one movewindowv2 per window).
+- `state_snapshot()` carries `extensions: ext_info()`; Main.qml mirrors it as
+  `extensions`, and Settings.qml turns it into `extGroups` → `allKeybindGroups`, so each
+  extension gets its own group in the Keybinds tab. `edit.keybinds` already contains
+  every daemon-known action id, so the rows record/clear with no extra plumbing.
+- Reference extension (separate repo, deliberately NOT bundled):
+  `/media/DEV/Scripts/Linux/hyperzone-flip` → github.com/patalbansishashank/hyperzone-flip.
+
+## /media/DEV is flaky (ntfs3)
+
+Writing via **tmp-file + rename** intermittently fails with `ENOENT` on the rename —
+Settings.qml hit this repeatedly while hyperzone.py in the same directory was fine. The
+Edit/Write tools use that pattern, so when it happens: edit a copy in the scratchpad and
+`cp` it over (plain `cp` writes in place and works), then `diff` to confirm. Always back
+the file up to local disk first — an interrupted write here has lost this file before.
+
 ## Git / push
 
 Remote is HTTPS with no stored creds; SSH keys aren't set up. Push works via the GitHub CLI:

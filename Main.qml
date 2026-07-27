@@ -19,6 +19,7 @@ Item {
   property var config: ({})          // effective config (divider source form)
   property var monitors: []          // live monitors incl. availableModes
   property var pendingLayout: null   // {deadline, remaining} while a display change awaits confirm
+  property var extensions: []        // installed extensions + the actions they registered
   property bool migrated: false      // hyprland.lua sources monitors.lua yet?
 
   readonly property string daemonPath: (pluginApi ? pluginApi.pluginDir : "") + "/hyperzone.py"
@@ -76,6 +77,7 @@ Item {
     if (s.config) root.config = s.config
     if (s.monitors) root.monitors = s.monitors
     root.pendingLayout = s.pending_layout || null
+    root.extensions = s.extensions || []
     root.migrated = !!s.migrated
   }
 

@@ -87,7 +87,8 @@ order** (top = first) and each row's checkbox marks a zone **subdividable** (it
 splits in two when a second window lands there); a second list orders which
 subdividable zone fills first.
 
-**Keybinds** — every action HyperZone binds, recorded by pressing the shortcut,
+**Keybinds** — every action HyperZone binds (plus one group per installed
+[extension](#extensions)), recorded by pressing the shortcut,
 plus the **Mouse gesture**: which modifier + mouse button drags a window, and
 which key toggles the drop between *snap into the zone* and *leave it floating*
 (the border colour tracks the armed side, and the toggle starts on the side the
@@ -121,6 +122,46 @@ top-left, top-right, bottom-left, bottom-right (= Zone 1–4). `fill` is the
 whole-zone fill order, `subdivide` the zones that split (in subdivision-fill
 order). The legacy explicit-`cells` form is still accepted. Set `HYPERZONE_OFF=1`
 to disable the daemon.
+
+## Extensions
+
+Some ideas are worth having but not worth shipping to everyone — they only make sense for one desk, one workflow, one set of monitors. Those live **outside** HyperZone, as extensions.
+
+An extension is a single `.py` file in `~/.config/hyperzone/extensions/`. The filename is its id. It declares actions; each one gets a **row in the Keybinds tab** like any built-in, and the user picks the key. Nothing ships in that directory, and an install with none behaves exactly as if none of this existed.
+
+```python
+API_VERSION = 1
+NAME = "Desk mirror"                 # heading shown in Settings → Keybinds
+DESCRIPTION = "What it does, in one line"
+
+def horizontal(api):
+    api.log("monitors:", api.monitor_rects())
+
+def register(api):
+    api.action("horizontal", horizontal, label="Mirror the desk",
+               default=[])           # bound to nothing until the user picks a key
+```
+
+That registers the action id `flip.horizontal` (file `flip.py` + action `horizontal`). Keys are bound through the normal settings UI and stored in `config.json` like every other keybind.
+
+The `api` object is the entire contract — anything not on it is internal and may change:
+
+| | |
+|---|---|
+| `action(name, fn, label, desc, default)` | declare a keybindable action (only from `register`) |
+| `monitors()` / `monitor_rects()` | live monitor records / `{name: (x, y, w, h)}` in **logical** px |
+| `managed_names()` | monitors HyperZone is currently tiling |
+| `layouts()` | `{name: layout}` in source form (zones/vsplit/hsplit/fill/subdivide) |
+| `trees(name)` / `set_trees(name, trees)` | a monitor's zone trees (deep copy in, replace out) |
+| `set_layouts({name: layout})` | validate → persist → re-tile, same path as the settings UI |
+| `dispatch([exprs])` | run Hyprland dispatchers |
+| `retile(force=False)` · `suspend(seconds)` · `log(*a)` | re-tile · ignore window-move reactions briefly · log |
+
+A zone tree is a leaf `{"win": addr|None}` or a split `{"split": "v"|"h", "ratio", "a", "b"}` — `"v"` divides width (left\|right), `"h"` divides height (top\|bottom). That format is stable API.
+
+Extensions load before the config, so their actions are valid keybind targets from the first startup. **A broken extension is logged and skipped, never fatal** — a tiling daemon that refuses to start because a side project has a syntax error would be worse than anything an extension could do. Anything that moves windows between monitors wholesale should call `api.suspend()` first, or the tiler will chase them mid-flight.
+
+Reference implementation: [**hyperzone-flip**](https://github.com/patalbansishashank/hyperzone-flip) — mirrors the desktop left↔right, flipping the zones on a screen that sits in the middle.
 
 ## Troubleshooting
 

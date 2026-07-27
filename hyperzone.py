@@ -43,6 +43,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 
 # ───────────────────────── configuration ─────────────────────────
 # Effective gaps, borrowed live from the Hyprland config (see refresh_gaps).
@@ -97,6 +98,10 @@ STATE_PATH = f"{RUNTIME}/hyperzone-state.json"
 VERSION = "2.0.0"
 _CFG_HOME = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
 CONFIG_PATH = os.path.join(_CFG_HOME, "hyperzone", "config.json")
+# Third-party extensions: every *.py dropped in here is loaded at startup and may
+# register keybindable actions (see ExtensionAPI). Nothing ships in it — it exists so
+# a setup-specific action lives in ITS OWN repo instead of in this file.
+EXT_DIR = os.path.join(_CFG_HOME, "hyperzone", "extensions")
 HYPRLAND_LUA = os.path.join(_CFG_HOME, "hypr", "hyprland.lua")
 MONITORS_LUA = os.path.join(_CFG_HOME, "hypr", "monitors.lua")
 MIGRATE_MARKER = "-- hyperzone-managed monitors"
@@ -1277,8 +1282,220 @@ class Monitor:
                 for zi, t in enumerate(self.trees) if t is not None}
 
 
+# ───────────────────────── extensions ─────────────────────────
+# HyperZone ships the tiler; an extension is a single .py file in EXT_DIR that adds
+# an ACTION to it — a keybindable verb that gets a row in the settings UI like any
+# built-in one. This exists so a setup-specific idea (mirror my desk, cycle my
+# monitors, …) can live in its own repo, on its own release schedule, without
+# growing this file or landing on everyone else's machine. Nothing is bundled: an
+# install with an empty EXT_DIR behaves exactly as if none of this were here.
+#
+# The contract is deliberately small — an extension gets ExtensionAPI and nothing
+# else. Anything not on that object is internal and may change between releases.
+EXT_API_VERSION = 1
+EXTENSIONS = {}          # ext id -> {"id","name","desc","version","path","actions":[…]}
+EXT_ACTIONS = {}         # "<ext>.<action>" -> {"ext","label","desc","fn"}
+
+
+def _ext_ident(s):
+    """An extension / action name: lowercase, no dots. Action ids reach Hyprland
+    inside a Lua string and come back through hzctl's argv, so the vocabulary is
+    restricted at the door rather than trusted."""
+    s = str(s)
+    return bool(s) and len(s) <= 32 and all(
+        ch in "abcdefghijklmnopqrstuvwxyz0123456789-_" for ch in s)
+
+
+class ExtensionAPI:
+    """The whole public surface an extension may use. Handed to `register(api)` at
+    load time and to every action when it fires.
+
+    Zone trees (trees()/set_trees) are the one structural thing exposed: a list with
+    one entry per zone, each a leaf `{"win": addr|None}` or a split
+    `{"split": "v"|"h", "ratio": float, "a": node, "b": node}` — "v" divides width
+    (left|right), "h" divides height (top|bottom). That format is stable API."""
+
+    VERSION = EXT_API_VERSION
+
+    def __init__(self):
+        self.hz = None          # the running daemon; set once it exists
+        self._loading = None    # ext id currently being registered
+
+    # -- declaring what this extension can do --
+    def action(self, name, fn, label=None, desc=None, default=None):
+        """Register a keybindable action. `fn(api)` runs on the daemon thread when the
+        key is pressed. `default` is the out-of-box combo list — leave it empty and the
+        action ships bound to nothing, which is what you want for anything opinionated."""
+        ext = self._loading
+        if ext is None:
+            raise RuntimeError("api.action() may only be called from register()")
+        if not _ext_ident(name):
+            raise ValueError("bad action name %r" % (name,))
+        if not callable(fn):
+            raise ValueError("action %r: fn must be callable" % (name,))
+        act_id = "%s.%s" % (ext, name)
+        EXT_ACTIONS[act_id] = {"ext": ext, "fn": fn,
+                               "label": str(label or name.replace("-", " ").capitalize()),
+                               "desc": str(desc or "")}
+        # Slot into the same registries the built-in actions use, so the keybind
+        # machinery, the config validator and the settings UI need no special case.
+        KEYBIND_ACTIONS.add(act_id)
+        combos = [str(c) for c in (default or [])]
+        DEFAULT_KEYBINDS[act_id] = combos
+        KEYBINDS.setdefault(act_id, list(combos))
+        EXTENSIONS[ext]["actions"].append(act_id)
+        return act_id
+
+    def log(self, *a):
+        log("[%s]" % (self._loading or "ext"), *a)
+
+    # -- reading the world --
+    def monitors(self):
+        """Live monitor records (enabled outputs), straight from Hyprland."""
+        return self.hz.live_monitors() if self.hz else (hjson("monitors") or [])
+
+    def monitor_rects(self):
+        """{name: (x, y, w, h)} in LOGICAL desk coordinates — the space monitors are
+        actually arranged in (physical pixels ÷ scale, sides swapped when rotated).
+        Comparing raw width/height instead silently breaks on any scaled screen."""
+        out = {}
+        for m in self.monitors():
+            name = m.get("name")
+            if name:
+                x, y, w, h = logical_rect(m)
+                out[name] = (int(m.get("x", 0)), int(m.get("y", 0)), round(w), round(h))
+        return out
+
+    def managed_names(self):
+        """Monitors HyperZone currently tiles (zone-managed), by connector name."""
+        return list(self.hz.mons) if self.hz else []
+
+    def layouts(self):
+        """{monitor name: layout dict} in SOURCE form (zones/vsplit/hsplit/fill/
+        subdivide) for every live monitor — the same shape the settings UI edits."""
+        if not self.hz:
+            return {}
+        out = {}
+        for name, entry in (self.hz.effective_config().get("managed") or {}).items():
+            if isinstance(entry.get("layout"), dict):
+                out[name] = json.loads(json.dumps(entry["layout"]))
+        return out
+
+    def trees(self, name):
+        """A deep copy of one managed monitor's zone trees, or None if not managed."""
+        mon = self.hz.mons.get(name) if self.hz else None
+        return json.loads(json.dumps(mon.trees)) if mon else None
+
+    # -- changing things --
+    def set_trees(self, name, trees):
+        """Replace a managed monitor's zone trees. The zone COUNT must match — the
+        number of zones is the layout's business, not an extension's."""
+        mon = self.hz.mons.get(name) if self.hz else None
+        if mon is None:
+            raise ValueError("%s is not managed" % name)
+        if not isinstance(trees, list) or len(trees) != len(mon.trees):
+            raise ValueError("%s: expected %d zone trees" % (name, len(mon.trees)))
+        mon.trees = trees
+
+    def set_layouts(self, layouts):
+        """Persist new zone layouts: {monitor name: layout dict}. Goes through the
+        normal validate → write → reload → retile path, so a bad layout is rejected
+        with the config file untouched, exactly as if the UI had saved it."""
+        if not self.hz:
+            return
+        cfg = self.hz.effective_config()
+        managed = cfg.setdefault("managed", {})
+        for name, layout in layouts.items():
+            entry = dict(managed.get(name) or {})
+            entry["layout"] = layout
+            entry.pop("cells", None)        # source form wins over any legacy compile
+            managed[name] = entry
+        self.hz.rpc_set_config({"config": cfg})
+
+    def dispatch(self, exprs):
+        """Run Hyprland dispatchers, e.g.
+        `hl.dsp.workspace.swap_monitors({monitor1="DP-1", monitor2="VGA-1"})`."""
+        hbatch(list(exprs))
+
+    def retile(self, force=False):
+        self.hz.retile(force=force) if self.hz else None
+
+    def suspend(self, seconds=0.5):
+        """Ignore window-move reactions for a moment. Anything that moves windows
+        between monitors wholesale needs this: Hyprland fires a movewindowv2 per
+        window, and the tiler would re-adopt each one mid-flight, fighting whatever
+        the extension is in the middle of doing."""
+        if self.hz:
+            self.hz.ext_settle = time.time() + max(0.0, float(seconds))
+
+
+EXT_API = ExtensionAPI()
+
+
+def load_extensions():
+    """Load every *.py in EXT_DIR (filename = extension id) and call its
+    `register(api)`. Must run BEFORE the user config: the actions it registers are
+    what make `keybinds` entries for them valid.
+
+    A broken extension is logged and skipped — never fatal. A tiling daemon that
+    refuses to start because someone's side project has a syntax error would be a
+    worse bug than anything an extension could cause."""
+    if not os.path.isdir(EXT_DIR):
+        return
+    import importlib.util          # only pay for this when extensions exist
+    for path in sorted(glob.glob(os.path.join(EXT_DIR, "*.py"))):
+        ext_id = os.path.splitext(os.path.basename(path))[0]
+        if not _ext_ident(ext_id):
+            log("extension: skipping %s (id must be [a-z0-9_-])" % path)
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("hyperzone_ext_" + ext_id, path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            want = int(getattr(mod, "API_VERSION", EXT_API_VERSION))
+            if want != EXT_API_VERSION:
+                log("extension %s: needs API v%d, this HyperZone speaks v%d — skipped"
+                    % (ext_id, want, EXT_API_VERSION))
+                continue
+            if not callable(getattr(mod, "register", None)):
+                log("extension %s: no register(api) function — skipped" % ext_id)
+                continue
+            EXTENSIONS[ext_id] = {"id": ext_id, "path": path, "actions": [],
+                                  "name": str(getattr(mod, "NAME", ext_id)),
+                                  "desc": str(getattr(mod, "DESCRIPTION", "")),
+                                  "version": str(getattr(mod, "VERSION", ""))}
+            EXT_API._loading = ext_id
+            mod.register(EXT_API)
+        except Exception as e:
+            EXTENSIONS.pop(ext_id, None)
+            for act in [a for a, v in EXT_ACTIONS.items() if v["ext"] == ext_id]:
+                EXT_ACTIONS.pop(act, None)
+                KEYBIND_ACTIONS.discard(act)
+                DEFAULT_KEYBINDS.pop(act, None)
+                KEYBINDS.pop(act, None)
+            log("extension %s failed to load:" % ext_id, repr(e))
+        finally:
+            EXT_API._loading = None
+    if EXTENSIONS:
+        log("extensions:", {e: EXTENSIONS[e]["actions"] for e in EXTENSIONS})
+
+
+def ext_info():
+    """Extension metadata for the settings UI — enough to render a keybind group
+    per extension without the QML knowing anything about what they do."""
+    return [{"id": e["id"], "name": e["name"], "desc": e["desc"], "version": e["version"],
+             "actions": [{"id": a, "label": EXT_ACTIONS[a]["label"],
+                          "desc": EXT_ACTIONS[a]["desc"]}
+                         for a in e["actions"] if a in EXT_ACTIONS]}
+            for e in EXTENSIONS.values() if e["actions"]]
+
+
 # ───────────────────────── the manager ─────────────────────────
 class HyperZone:
+    # Set by ExtensionAPI.suspend(): window-move reactions stand down until this
+    # time. Class-level so it always exists, even before __init__ has run.
+    ext_settle = 0.0
+
     def __init__(self):
         self.mons = {}              # name -> Monitor
         self.detached = set()       # addrs the user popped to free-float (ignored)
@@ -2112,6 +2329,7 @@ class Daemon(HyperZone):
                 "config": self.effective_config(),
                 "monitors": self.live_monitors(),
                 "pending_layout": self.pending_layout_info(),
+                "extensions": ext_info(),
                 "migrated": hyprland_is_migrated()}
 
     def pending_layout_info(self):
@@ -2266,6 +2484,9 @@ class Daemon(HyperZone):
     def _keybind_expr(self, combo, action):
         if action in KEYBIND_LUA:      # native dispatcher — no hzctl round-trip
             return 'hl.bind("%s", %s)' % (combo, KEYBIND_LUA[action])
+        if action in EXT_ACTIONS:      # extension verb: hzctl routes it back by id
+            return 'hl.bind("%s", hl.dsp.exec_cmd("%s ext %s"))' % (
+                combo, HZCTL_CMD, action)
         return 'hl.bind("%s", hl.dsp.exec_cmd("%s %s"))' % (
             combo, HZCTL_CMD, KEYBIND_CMDS[action])
 
@@ -3078,6 +3299,12 @@ class Daemon(HyperZone):
     def on_moved(self, addr):
         if addr in self.detached:
             return
+        if time.time() < self.ext_settle:
+            # An extension is moving windows between monitors wholesale (see
+            # ExtensionAPI.suspend). Hyprland fires one of these per window; reacting
+            # would re-adopt each one mid-flight, fighting the extension's own
+            # bookkeeping. It re-tiles when it's finished.
+            return
         if self.in_flight(addr):
             # Mid-drag monitor crossing. Reacting here is what made a managed
             # window teleport the instant it touched an unmanaged screen: we
@@ -3142,6 +3369,20 @@ class Daemon(HyperZone):
     # -- control commands from keybinds --
     DIRECTIONS = ("left", "right", "up", "down")
 
+    def cmd_ext(self, action):
+        """Run an extension action. Everything it can go wrong with is contained
+        here: an unknown id is ignored, and an exception inside third-party code is
+        logged, never allowed to take the tiler down with it."""
+        entry = EXT_ACTIONS.get(str(action or ""))
+        if entry is None:
+            log("ext: no such action", repr(action))
+            return
+        try:
+            entry["fn"](EXT_API)
+        except Exception as e:
+            log("ext %s failed:" % action, repr(e))
+            dlog(traceback.format_exc())
+
     def on_cmd(self, msg):
         cmd = msg.get("cmd")
         arg = msg.get("arg")
@@ -3161,6 +3402,9 @@ class Daemon(HyperZone):
         dlog("cmd", cmd, arg, active)
         if cmd == "shutdown":                # a takeover daemon asked us to stand down
             self.stop = True
+            return
+        if cmd == "ext":                     # an extension's action (see ExtensionAPI)
+            self.cmd_ext(arg)
             return
         self.gc()                            # clear any dead-window ghosts first
         if cmd == "retile":
@@ -4248,8 +4492,13 @@ def main():
         if os.environ.get(KILL_ENV) in ("1", "true", "yes"):
             log("disabled via", KILL_ENV)
             return
+        # Extensions BEFORE the config: loading them is what makes their actions
+        # valid keybind targets, so a config.json binding one must find it registered.
+        load_extensions()
         load_user_config()   # optional ~/.config/hyperzone/config.json overlay
-        Daemon().run(stdio="--stdio" in sys.argv[2:])
+        d = Daemon()
+        EXT_API.hz = d
+        d.run(stdio="--stdio" in sys.argv[2:])
     else:
         if not send(cmd, arg):
             cli_fallback(cmd, arg)
