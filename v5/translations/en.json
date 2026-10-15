@@ -1,0 +1,15 @@
+{
+  "settings": {
+    "cursor_overlay": {
+      "label": "Draw the cursor pointer arrow",
+      "description": "The \"Show cursor pointer arrow\" keybind draws an arrow at the cursor through a small GTK overlay helper (needs python-gobject, gtk4-layer-shell and python-cairo). Takes effect when the daemon restarts."
+    },
+    "daemon_path": {
+      "label": "Daemon script",
+      "description": "Path to hyperzone.py. Empty = the one next to this plugin (or one level up, in the repo). Takes effect when the daemon restarts."
+    },
+    "glyph": {
+      "label": "Glyph"
+    }
+  }
+}

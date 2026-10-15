@@ -1,0 +1,64 @@
+# HyperZone for Noctalia 5 — zone tiling for big Hyprland screens plus a display editor.
+#
+# The Python daemon (../hyperzone.py, shared with the Noctalia 4 plugin) does all the work. This
+# plugin owns it and is a thin skin over it:
+#   service  -> runs `hyperzone.py daemon --events --overlay overlay.py` via runStream, mirrors its
+#               state into noctalia.state, turns its events into notifications
+#   widget   -> bar button: opens the settings panel, right click re-tiles
+#   panel    -> the settings UI (Displays / Zones / Keybinds / General)
+# Requests go over the daemon's control socket through hzrpc.py (the host cannot write a
+# runStream child's stdin). The cursor-pointer arrow is drawn by overlay.py (GTK 4 +
+# gtk4-layer-shell), because no plugin surface can be a click-through overlay above windows.
+#
+# plugin_api 24: argv-form runAsync (24) is the newest capability used; it also covers relative
+# require (22), service lifecycle (17), nowMs (12), UI closures (9) and panel options (8).
+
+id = "shashank/hyperzone"
+name = "HyperZone"
+version = "3.0.0"
+plugin_api = 24
+author = "shashank"
+license = "MIT"
+icon = "layout-grid"
+description = "Zone tiling for big Hyprland screens plus a real display editor."
+tags = ["hyprland", "tiling", "windows", "displays"]
+dependencies = ["python3", "python-gobject", "gtk4-layer-shell", "python-cairo"]
+
+[[setting]]
+key = "cursor_overlay"
+type = "bool"
+label_key = "settings.cursor_overlay.label"
+description_key = "settings.cursor_overlay.description"
+default = true
+
+[[setting]]
+key = "daemon_path"
+type = "file"
+label_key = "settings.daemon_path.label"
+description_key = "settings.daemon_path.description"
+default = ""
+extensions = [".py"]
+advanced = true
+
+[[service]]
+id = "daemon"
+entry = "service.luau"
+
+[[widget]]
+id = "zones"
+entry = "widget.luau"
+
+  [[widget.setting]]
+  key = "glyph"
+  type = "glyph"
+  label_key = "settings.glyph.label"
+  default = "layout-grid"
+
+[[panel]]
+id = "settings"
+entry = "panel.luau"
+width = 760
+height = 780
+placement = "floating"
+position = "center"
+open_near_click = false

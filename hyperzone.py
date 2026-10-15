@@ -15,6 +15,10 @@ whatever native layout the *other* monitors use.
 
 Run as:
     hyperzone.py daemon            # long-running; autostarted from hyprland.lua
+    hyperzone.py daemon --stdio    # owned by the Noctalia 4 plugin: JSON-RPC over stdin/stdout
+    hyperzone.py daemon --events [--overlay HELPER]
+                                   # owned by the Noctalia 5 plugin: events on stdout, RPC over
+                                   # the control socket, cursor arrow drawn by HELPER
     hyperzone.py <cmd> [arg]       # keybind helper; forwards to the daemon
         move <left|right|up|down>   # move focused window within its screen
         tomon <left|right|up|down>  # send focused window to the next monitor
@@ -39,6 +43,7 @@ import os
 import re
 import selectors
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -311,6 +316,14 @@ LOCATE_POLL_S = 0.03          # cursor re-sample cadence while the arrow is up (
 LOCATE_MAX_S = 30.0           # hard cap on a single activation (jitter safety)
 LOCATE_MOVE_EPS = 2           # px of motion that counts as "still moving" (refreshes the hold)
 LOCATE_ARROW_COLOR = "#ffffff"        # arrow tint (drawn by the plugin overlay)
+# --events mode (Noctalia 5). Its host splits our stdout into lines and drops any line
+# that grows past 64 KiB while still incomplete, so an event bigger than this is sent
+# as a bare "refetch" hint and the plugin pulls the full state over the control socket.
+EVENT_LINE_MAX = 48 * 1024
+PARENT_CHECK_S = 2.0          # how often an --events daemon checks its owner is still alive
+CTL_RECV_TIMEOUT = 1.0        # a control-socket client gets this long to finish its request
+CTL_REQ_MAX = 4 * 1024 * 1024 # and this many bytes (a set_config carries the whole config)
+OVERLAY_LOG = f"{RUNTIME}/hyperzone-overlay.log"
 KEYBINDS = {k: list(v) for k, v in DEFAULT_KEYBINDS.items()}
 KEYBIND_MARKER = "-- hyperzone-managed keybinds"
 # verbs whose hand-written hyprland.lua binds we take over (mouse drag-binds
@@ -2214,6 +2227,13 @@ class Daemon(HyperZone):
         self.stop = False           # set by the `shutdown` cmd -> loop exits cleanly
         self.stdio = False          # RPC-over-stdio mode (owned by a Noctalia plugin)
         self.rpc_out = None         # private handle to the REAL stdout (see run())
+        self.events = False         # owned by a Noctalia 5 plugin: events out on stdout, requests
+                                    # in over the control socket (its host cannot write our stdin)
+        self.parent_pid = None      # --events: the owner; reparenting means it died -> we stop
+        self.parent_check_at = None
+        self.overlay_cmd = None     # --overlay: helper process that draws the cursor arrow
+        self.overlay = None         # its Popen while running (started on the first locate)
+        self._wake_r = None         # self-pipe: a signal handler wakes select() through it
         self.layout_revert_at = None    # deadline to auto-revert a pending display layout
         self.layout_prev_specs = None   # live specs snapshotted before an apply (for exact revert)
         self.monitors_refresh_at = None # deadline for a deferred (settled) monitors_changed push
@@ -2237,10 +2257,123 @@ class Daemon(HyperZone):
             self.rpc_out.flush()
         except (OSError, ValueError) as e:
             log("rpc write error", e)
+            if self.events and isinstance(e, BrokenPipeError):
+                log("owner closed our stdout; stopping")
+                self.rpc_out = None
+                self.stop = True
 
     def emit(self, event, data=None):
-        """Push an unsolicited event to the plugin (no-op outside stdio mode)."""
-        self._rpc_write({"event": event, "data": {} if data is None else data})
+        """Push an unsolicited event to the plugin (no-op outside stdio/events mode).
+        With an overlay helper, the cursor-arrow frames go to it instead."""
+        data = {} if data is None else data
+        if self.overlay_cmd and event.startswith("locate"):
+            self._overlay_send(event, data)
+            return
+        if self.events:
+            line = json.dumps({"event": event, "data": data})
+            if len(line) > EVENT_LINE_MAX:
+                data = {"refetch": True}
+        self._rpc_write({"event": event, "data": data})
+
+    # -- cursor-arrow overlay helper (--overlay) --
+    def _overlay_alive(self):
+        return self.overlay is not None and self.overlay.poll() is None
+
+    def _overlay_start(self):
+        """Start the helper that draws the arrow. It stays up between activations (a
+        GTK start costs a few hundred ms, too slow for a keypress) with nothing on
+        screen, and dies with us."""
+        self._overlay_stop()
+        try:
+            err = open(OVERLAY_LOG, "a")
+        except OSError:
+            err = subprocess.DEVNULL
+        try:
+            self.overlay = subprocess.Popen([sys.executable, self.overlay_cmd],
+                                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                            stderr=err, close_fds=True)
+            os.set_blocking(self.overlay.stdin.fileno(), False)
+            log("overlay helper started:", self.overlay_cmd, "pid", self.overlay.pid)
+        except OSError as e:
+            log("overlay helper failed to start:", e)
+            self.overlay = None
+        finally:
+            if err is not subprocess.DEVNULL:
+                err.close()
+
+    def _overlay_stop(self):
+        if self.overlay is None:
+            return
+        try:
+            self.overlay.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.overlay.terminate()
+            self.overlay.wait(timeout=1.0)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                self.overlay.kill()
+            except OSError:
+                pass
+        self.overlay = None
+
+    def _overlay_send(self, event, data):
+        if event == "locate" and not self._overlay_alive():
+            self._overlay_start()
+        if not self._overlay_alive():
+            return
+        try:
+            os.write(self.overlay.stdin.fileno(),
+                     (json.dumps({"event": event, "data": data}) + "\n").encode())
+        except BlockingIOError:
+            pass                       # helper is behind: drop this frame, the next supersedes it
+        except OSError as e:
+            log("overlay helper write failed:", e)
+            self._overlay_stop()
+
+    def on_ctl_rpc(self, conn, msg):
+        """A JSON-RPC request that arrived on the control socket ({"rpc": method,
+        "params": {...}}): same handlers as the stdio channel, reply written back on
+        the same connection. This is how a Noctalia 5 plugin talks to us, since its
+        host gives it our stdout but no way to write our stdin."""
+        method, params = msg.get("rpc"), msg.get("params") or {}
+        handler = self.RPC.get(method)
+        if handler is None:
+            out = {"error": {"message": "unknown method: %s" % method}}
+        else:
+            try:
+                out = {"result": handler(self, params)}
+            except Exception as e:
+                log("rpc error", method, repr(e))
+                out = {"error": {"message": str(e)}}
+        try:
+            conn.settimeout(5.0)
+            conn.sendall((json.dumps(out) + "\n").encode())
+        except OSError as e:
+            log("ctl rpc reply failed", method, e)
+
+    @staticmethod
+    def _recv_ctl(conn):
+        """Read one control-socket request. hzctl's one-liners arrive whole in the
+        first read; an RPC can be bigger than one read, so keep going until the
+        client half-closes (or the request parses, or the limits hit)."""
+        conn.settimeout(CTL_RECV_TIMEOUT)
+        buf = conn.recv(65536)
+        try:
+            json.loads(buf)
+            return buf.decode("utf-8", "replace").strip()
+        except ValueError:
+            pass
+        while buf and len(buf) < CTL_REQ_MAX:
+            try:
+                chunk = conn.recv(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        return buf.decode("utf-8", "replace").strip()
 
     def reply(self, rid, result=None, error=None):
         if error is not None:
@@ -2330,6 +2463,7 @@ class Daemon(HyperZone):
                 "monitors": self.live_monitors(),
                 "pending_layout": self.pending_layout_info(),
                 "extensions": ext_info(),
+                "default_keybinds": DEFAULT_KEYBINDS,
                 "migrated": hyprland_is_migrated()}
 
     def pending_layout_info(self):
@@ -2965,8 +3099,14 @@ class Daemon(HyperZone):
         log("migrated hyprland.lua; backup:", backup, "blocks:", n)
         return {"changed": True, "backup": backup}
 
+    def rpc_ping(self, params):
+        """Cheap liveness probe: who answers the control socket, and in which mode."""
+        return {"pid": os.getpid(), "version": VERSION,
+                "mode": "stdio" if self.stdio else ("events" if self.events else "bare")}
+
     # method name -> handler
     RPC = {
+        "ping": rpc_ping,
         "get_state": rpc_get_state,
         "get_monitors": rpc_get_monitors,
         "set_config": rpc_set_config,
@@ -3086,6 +3226,11 @@ class Daemon(HyperZone):
                 self._drag_watch()           # carry the drag / fallback drop detection
         if self.layout_revert_at is not None and now >= self.layout_revert_at:
             self.revert_layout("timeout")   # nobody confirmed -> auto-restore
+        if self.parent_check_at is not None and now >= self.parent_check_at:
+            self.parent_check_at = now + PARENT_CHECK_S
+            if os.getppid() != self.parent_pid:
+                log("owner (pid %s) is gone; stopping" % self.parent_pid)
+                self.stop = True
         if self.monitors_refresh_at is not None and now >= self.monitors_refresh_at:
             self.monitors_refresh_at = None
             # A live `eval hl.monitor` apply fires NO configreloaded event, so the
@@ -3121,6 +3266,8 @@ class Daemon(HyperZone):
                              (DRAG_CARRY_S if self.drag["carry"] else DRAG_POLL_S))
         if self.capture_resume_at is not None:
             deadlines.append(self.capture_resume_at)
+        if self.parent_check_at is not None:
+            deadlines.append(self.parent_check_at)
         if not deadlines:
             return None
         return max(0.0, min(deadlines) - time.time())
@@ -4296,12 +4443,12 @@ class Daemon(HyperZone):
             probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             probe.settimeout(0.5)
             probe.connect(CTRL_SOCK)
-            if self.stdio:
+            if self.stdio or self.events:
                 probe.sendall(json.dumps({"cmd": "shutdown"}).encode())
             probe.close()
         except OSError:
             return True                       # stale socket, nobody listening
-        if not self.stdio:
+        if not (self.stdio or self.events):
             log("another daemon is already running; exiting")
             return False
         for _ in range(20):                   # wait up to ~2s for it to let go
@@ -4359,12 +4506,35 @@ class Daemon(HyperZone):
         ctl.setblocking(False)
         self.sel.register(ctl, selectors.EVENT_READ, ("ctl", None))
 
-    def run(self, stdio=False):
+    def _on_signal(self, signum, frame):
+        """SIGTERM/SIGINT: stop through the normal path (state saved, helper reaped).
+        A Noctalia 5 host stops its plugin's processes with SIGTERM."""
+        self.stop = True
+        try:
+            os.write(self._wake_w, b"x")
+        except OSError:
+            pass
+
+    def _install_signal_wakeup(self):
+        self._wake_r, self._wake_w = os.pipe()
+        os.set_blocking(self._wake_r, False)
+        os.set_blocking(self._wake_w, False)
+        self.sel.register(self._wake_r, selectors.EVENT_READ, ("wake", None))
+        signal.signal(signal.SIGTERM, self._on_signal)
+        signal.signal(signal.SIGINT, self._on_signal)
+
+    def run(self, stdio=False, events=False, overlay=None):
         self.stdio = stdio
-        if stdio:
+        self.events = events and not stdio
+        self.overlay_cmd = overlay
+        if stdio or self.events:
             self._harden_stdio()
+        if self.events:
+            self.parent_pid = os.getppid()
+            self.parent_check_at = time.time() + PARENT_CHECK_S
         if not self._acquire_control_socket():
             return
+        self._install_signal_wakeup()
         self._connect_event_socket()
         self._bind_control_socket()
         refresh_gaps()              # borrow gaps/border from the live Hyprland config
@@ -4389,11 +4559,19 @@ class Daemon(HyperZone):
             self.emit("ready", self.state_snapshot())
             for w in lua_warnings:     # surface them in the UI, not just the log
                 self.emit("error", {"message": w})
+        if stdio or self.events:
             # take ownership of the HyperZone keybinds: comment the hand-written
             # ones out of hyprland.lua (once) and register the configured set live.
             self.migrate_keybinds()
             self.register_keybinds(initial=True)
-        log("daemon up; managing", list(self.mons), "stdio" if stdio else "")
+        if self.events:
+            # The owner reads events from our stdout; its requests arrive on the control
+            # socket (see on_ctl_rpc). No stdin channel: EOF there means nothing here.
+            self.emit("ready", self.state_snapshot())
+            for w in lua_warnings:
+                self.emit("error", {"message": w})
+        log("daemon up; managing", list(self.mons),
+            "stdio" if stdio else ("events" if self.events else ""))
         while not self.stop:
             for key, _ in self.sel.select(self.next_timeout()):
                 kind = key.data[0]
@@ -4401,13 +4579,22 @@ class Daemon(HyperZone):
                     conn, _ = key.fileobj.accept()
                     data = ""
                     try:
-                        data = conn.recv(8192).decode("utf-8", "replace").strip()
+                        data = self._recv_ctl(conn)
                         if data:
-                            self.on_cmd(json.loads(data))
+                            msg = json.loads(data)
+                            if "rpc" in msg:
+                                self.on_ctl_rpc(conn, msg)
+                            else:
+                                self.on_cmd(msg)
                     except Exception as e:
                         log("ctl error:", repr(e), "handling", data[:200])
                     finally:
                         conn.close()
+                elif kind == "wake":
+                    try:
+                        os.read(self._wake_r, 512)
+                    except OSError:
+                        pass
                 elif kind == "event":
                     buf = key.data[1]
                     try:
@@ -4440,8 +4627,11 @@ class Daemon(HyperZone):
                             self.on_rpc(text)
                     self.sel.modify(0, selectors.EVENT_READ, ("rpc", buf))
             # after handling any events (or a timeout), run due timers
+            if self.stop:
+                break
             self.tick()
         self.save()
+        self._overlay_stop()
         log("daemon stopped")
 
 
@@ -4498,7 +4688,11 @@ def main():
         load_user_config()   # optional ~/.config/hyperzone/config.json overlay
         d = Daemon()
         EXT_API.hz = d
-        d.run(stdio="--stdio" in sys.argv[2:])
+        opts = sys.argv[2:]
+        overlay = None
+        if "--overlay" in opts and opts.index("--overlay") + 1 < len(opts):
+            overlay = opts[opts.index("--overlay") + 1]
+        d.run(stdio="--stdio" in opts, events="--events" in opts, overlay=overlay)
     else:
         if not send(cmd, arg):
             cli_fallback(cmd, arg)
