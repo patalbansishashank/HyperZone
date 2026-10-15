@@ -13,6 +13,7 @@
 --     capture chords it declared up front, and never Super chords.
 
 local hz = require("./lib/hz.luau")
+local arrange = require("./lib/arrange.luau")
 
 local W = 700 -- content width inside the panel
 
@@ -24,27 +25,28 @@ local KEYBIND_GROUPS = {
     items = { { "move-left", "Move left" }, { "move-right", "Move right" }, { "move-up", "Move up" }, { "move-down", "Move down" } } },
   { title = "Send to monitor", desc = "Throw the window to the screen in that direction",
     items = { { "tomon-left", "To monitor ← left" }, { "tomon-right", "To monitor → right" }, { "tomon-up", "To monitor ↑ up" }, { "tomon-down", "To monitor ↓ down" } } },
-  { title = "Send to workspace", desc = "Throw the focused window to another workspace. Switching which workspace you are looking at stays with Hyprland (Super+1…0)",
+  { title = "Send to workspace", desc = "Throw the focused window to another workspace — the third axis of moving a window, alongside zones and monitors. Workspaces 1 and 10 also answer to Super+Ctrl+Home/End. (Switching which workspace you're LOOKING at stays with Hyprland: Super+1…0)",
     items = { { "tows-1", "To workspace 1" }, { "tows-2", "To workspace 2" }, { "tows-3", "To workspace 3" }, { "tows-4", "To workspace 4" },
               { "tows-5", "To workspace 5" }, { "tows-6", "To workspace 6" }, { "tows-7", "To workspace 7" }, { "tows-8", "To workspace 8" },
               { "tows-9", "To workspace 9" }, { "tows-10", "To workspace 10" }, { "tows-special", "To special (magic)" } } },
   { title = "Move across everything", desc = "Rearrange in-screen, then spill to the next monitor at the edge",
     items = { { "push-left", "Push left" }, { "push-right", "Push right" }, { "push-up", "Push up" }, { "push-down", "Push down" } } },
-  { title = "Swap window", desc = "Trade places with the window in that direction — works across screens too",
+  { title = "Swap window", desc = "Trade places with the window in that direction — works across screens too. Focus follows the AREA: the window that arrives where you were working takes focus, so you keep looking at the same spot",
     items = { { "swap-left", "Swap ← left" }, { "swap-right", "Swap → right" }, { "swap-up", "Swap ↑ up" }, { "swap-down", "Swap ↓ down" } } },
-  { title = "Window state", desc = "Fullscreen the focused window · Group stacks the windows in a zone as tabs",
+  { title = "Window state", desc = "Fullscreen the focused window · Group tabs the windows in a zone together, so they stack as tabs instead of splitting the space",
     items = { { "fullscreen", "Toggle fullscreen" }, { "toggle-group", "Toggle group / tabs" } } },
-  { title = "Close window", desc = "Close asks the window to close · Force kill SIGKILLs the whole process (no save prompt, every window it owns)",
+  { title = "Close window", desc = "Close asks the window to close — an app that lives in the tray (Discord, Steam) just hides and keeps running. Force kill SIGKILLs the process instead: no save prompt, no cleanup, and it takes EVERY window that process owns (all Chromium profile windows share one process; so do all Unreal Editor panels)",
     items = { { "close-window", "Close window" }, { "kill-window", "Force kill app (no save!)" } } },
-  { title = "Cursor pointer", desc = "Pops an arrow that points at the cursor and follows it live, then fades once you stop moving",
+  { title = "Cursor pointer", desc = "Lost the pointer across all these screens — or want to point things out on a screen share? This pops a sleek arrow that points at the cursor and follows it live, then fades once you stop moving",
     items = { { "locate-cursor", "Show cursor pointer arrow" } } },
   { title = "Actions", desc = "Re-tile re-snaps windows into their zones · Rearrange is a hard reset that also reclaims floated windows",
     items = { { "toggle-float", "Toggle float" }, { "rearrange", "Rearrange all" }, { "retile", "Re-tile / re-snap" } } },
-  { title = "Mouse gesture", desc = "Hold the modifier and drag with the left button to move a window; the toggle key flips mid-drag between snapping into the zone and leaving it floating (amber border)",
+  { title = "Mouse gesture", desc = "Drag a window with the mouse, and flip mid-drag what letting go will do — the border shows which side is armed: amber = left free-floating where you drop it, normal = snapped into the zone under the cursor (back into tiling on an unmanaged screen). It starts on the side the window is already on, so a drag changes nothing by itself; holding the toggle key as you grab starts on the other side. The left mouse button itself is fixed, so type the modifier you hold with it; remove a binding to switch that half off",
     items = { { "drag-window", "Drag a window", "drag" }, { "drag-toggle", "Toggle the drop", "modifier" } } },
 }
 
 local ZONE_NAMES = { "Blue", "Green", "Orange", "Red" }
+local ZONE_EMOJI = { "🟦", "🟩", "🟧", "🟥" }
 local ZONE_HEX = { "#4c8dff", "#3fc16a", "#f59234", "#ef5350" }
 local ZONE_FILL = { "#4c8dff38", "#3fc16a38", "#f5923438", "#ef535038" }
 local SCALES = { "1", "1.25", "1.33", "1.5", "1.6", "1.67", "1.75", "2" }
@@ -69,6 +71,10 @@ local loadRev = 0 -- bumped on every reload, so uncontrolled inputs re-seed
 local addRev = 0  -- bumped to clear "add" inputs after a submit
 local kbDraft = {} -- action id -> text typed into its add field
 local denyDraft = ""
+local scrollRev = 0    -- bumped to jump the tab's scroll to the bottom
+local nudgeStep = 10   -- px per arrow press in the arrangement editor
+local preview = nil    -- dry-run result of the current display edits (preview_monitor_layout)
+local previewErr = nil
 
 local render -- forward
 
@@ -331,6 +337,7 @@ local function reloadDisplays()
   for _, m in ipairs(snap and snap.monitors or {}) do
     table.insert(dispEdit, {
       name = m.name, description = m.description or "", mode = currentModeOf(m), x = m.x or 0, y = m.y or 0,
+      pw = m.width, ph = m.height,
       scale = m.scale or 1, transform = m.transform or 0, disabled = m.disabled == true,
       noEdid = m.noEdid == true, modes = copyList(m.availableModes),
     })
@@ -443,14 +450,74 @@ local function labelled(title, control)
 end
 
 -- ---------------------------------------------------------------- Displays tab
+local NUDGE_STEPS = { 1, 10, 100 }
+
+local function moveDisp(i, x, y)
+  local d = dispEdit[i]
+  if d == nil then
+    return
+  end
+  d.x, d.y = math.floor(x + 0.5), math.floor(y + 0.5)
+  preview, previewErr = nil, nil
+  loadRev += 1 -- re-seed the X / Y fields
+end
+
+local function onArrangeDrop(payload, value)
+  local g = arrange.geometry(dispEdit, W, 300)
+  local di, x, y, other = arrange.resolve(dispEdit, payload, value, g.snapThr)
+  if di == nil then
+    return
+  end
+  if other ~= nil then
+    moveDisp(other[1], other[2], other[3])
+  end
+  moveDisp(di, x, y)
+  dispSel = di
+  render()
+end
+
+local function nudge(dx, dy)
+  local d = selDisp()
+  if d == nil then
+    return
+  end
+  moveDisp(dispSel, d.x + dx * nudgeStep, d.y + dy * nudgeStep)
+  render()
+end
+
+-- Dry run: what an Apply would send to Hyprland and write to monitors.lua, without doing it.
+local function runPreview()
+  previewErr = nil
+  hz.rpc("preview_monitor_layout", { monitors = dispSpecs() }, function(r, err)
+    if err then
+      preview, previewErr = nil, err
+    else
+      preview = r
+    end
+    render()
+  end)
+end
+
+local function arrangeCard()
+  local kids = {
+    ui.row({ justify = "center" }, { arrange.build({ disps = dispEdit, sel = dispSel, width = W, height = 300,
+      onSelect = function(i) dispSel = i; render() end, onDrop = onArrangeDrop }) }),
+    hint("Drag a screen and drop it: on another screen's left / right / top / bottom edge strip to dock beside it, on its middle to swap the two, or anywhere in the empty space to place it there (edges snap to nearby screens). Click a screen to select it."),
+  }
+  for _, pair in ipairs(arrange.overlaps(dispEdit)) do
+    table.insert(kids, ui.label({ text = "⚠ " .. pair[1] .. " overlaps " .. pair[2], color = "error", fontSize = 12 }))
+  end
+  return ui.column({ gap = 8 }, kids)
+end
+
 local function displaysTab()
-  local kids = { heading("Displays"), hint("Pick a display, then set resolution, scale, rotation and position. Positions are logical px; the layout applies live with a 15-second Keep / Revert.") }
+  local kids = { heading("Displays"), arrangeCard() }
   local pick = {}
   for i, d in ipairs(dispEdit) do
     table.insert(pick, ui.button({
       key = "disp-" .. d.name, text = d.name, controlSize = "sm",
       variant = (i == dispSel) and "primary" or "outline",
-      tooltip = (d.description ~= "" and d.description or d.name) .. " · " .. string.gsub(d.mode, "Hz", "") .. " at " .. fmtNum(d.x) .. "," .. fmtNum(d.y),
+      tooltip = (d.description ~= "" and d.description or d.name),
       onClick = function() dispSel = i; render() end,
     }))
   end
@@ -475,41 +542,75 @@ local function displaysTab()
       si = #scaleLabels
     end
     local zc = zoneCountOf(d.name)
+    local lw, lh = arrange.logical(d)
+    local steps = {}
+    for _, st in ipairs(NUDGE_STEPS) do
+      table.insert(steps, ui.button({ key = "step" .. st, text = st .. " px", controlSize = "sm",
+        variant = (st == nudgeStep) and "secondary" or "ghost", onClick = function() nudgeStep = st; render() end }))
+    end
     table.insert(kids, ui.column({ gap = 10, padding = 12, radius = 10, fill = "surface_variant/0.5" }, {
       ui.label({ text = d.name .. (d.description ~= "" and ("  ·  " .. d.description) or ""), fontWeight = "semibold" }),
+      ui.label({ text = "Logical size " .. fmtNum(lw) .. " × " .. fmtNum(lh) .. " at " .. fmtNum(d.x) .. ", " .. fmtNum(d.y) ..
+        (d.disabled and " · disabled" or ""), fontSize = 12, color = "on_surface_variant" }),
       ui.row({ gap = 10 }, {
         labelled("Resolution", ui.select({ key = "mode-" .. d.name, options = modeLabels, width = 230,
           selectedIndex = math.max(0, (indexOf(d.modes, d.mode) or 1) - 1),
-          onChange = function(idx) local m = d.modes[(tonumber(idx) or 0) + 1]; if m then d.mode = m end; render() end })),
+          onChange = function(idx) local m = d.modes[(tonumber(idx) or 0) + 1]; if m then d.mode = m; preview = nil end; render() end })),
         labelled("Scale", ui.select({ key = "scale-" .. d.name, options = scaleLabels, width = 140, selectedIndex = si - 1,
-          onChange = function(idx) local k = SCALES[(tonumber(idx) or 0) + 1]; if k then d.scale = tonumber(k) end; render() end })),
+          onChange = function(idx) local k = SCALES[(tonumber(idx) or 0) + 1]; if k then d.scale = tonumber(k); preview = nil end; render() end })),
         labelled("Rotation", ui.select({ key = "rot-" .. d.name, options = ROTATIONS, width = 120, selectedIndex = d.transform % 4,
-          onChange = function(idx) d.transform = tonumber(idx) or 0; render() end })),
+          onChange = function(idx) d.transform = tonumber(idx) or 0; preview = nil; render() end })),
         labelled("Zones", ui.select({ key = "zc-" .. d.name, options = ZONE_COUNT_LABELS, width = 120,
           selectedIndex = (indexOf(ZONE_COUNTS, zc) or 1) - 1,
           onChange = function(idx) setZoneCount(d.name, ZONE_COUNTS[(tonumber(idx) or 0) + 1] or 1); render() end })),
       }),
-      ui.row({ gap = 10, align = "end" }, {
-        labelled("X", ui.input({ key = "x-" .. d.name .. "-" .. loadRev, value = tostring(math.floor(d.x + 0.5)), width = 120, controlSize = "sm",
-          onChange = function(v) local n = tonumber(v); if n then d.x = n end end })),
-        labelled("Y", ui.input({ key = "y-" .. d.name .. "-" .. loadRev, value = tostring(math.floor(d.y + 0.5)), width = 120, controlSize = "sm",
-          onChange = function(v) local n = tonumber(v); if n then d.y = n end end })),
-        ui.label({ text = "top-left corner, logical px", fontSize = 11, color = "on_surface_variant" }),
+      ui.row({ gap = 6, align = "end" }, {
+        labelled("X", ui.input({ key = "x-" .. d.name .. "-" .. loadRev, value = tostring(math.floor(d.x + 0.5)), width = 100, controlSize = "sm",
+          onSubmit = function(v) local n = tonumber(v); if n then moveDisp(dispSel, n, d.y) end; render() end,
+          onChange = function(v) local n = tonumber(v); if n then d.x = math.floor(n + 0.5); preview = nil end end })),
+        labelled("Y", ui.input({ key = "y-" .. d.name .. "-" .. loadRev, value = tostring(math.floor(d.y + 0.5)), width = 100, controlSize = "sm",
+          onSubmit = function(v) local n = tonumber(v); if n then moveDisp(dispSel, d.x, n) end; render() end,
+          onChange = function(v) local n = tonumber(v); if n then d.y = math.floor(n + 0.5); preview = nil end end })),
+        ui.spacer({ width = 8 }),
+        ui.button({ glyph = "arrow-left", controlSize = "sm", variant = "outline", tooltip = "Move left", onClick = function() nudge(-1, 0) end }),
+        ui.button({ glyph = "arrow-up", controlSize = "sm", variant = "outline", tooltip = "Move up", onClick = function() nudge(0, -1) end }),
+        ui.button({ glyph = "arrow-down", controlSize = "sm", variant = "outline", tooltip = "Move down", onClick = function() nudge(0, 1) end }),
+        ui.button({ glyph = "arrow-right", controlSize = "sm", variant = "outline", tooltip = "Move right", onClick = function() nudge(1, 0) end }),
+        ui.row({ gap = 2 }, steps),
       }),
     }))
     if d.noEdid then
-      table.insert(kids, hint("This display publishes no EDID, so it cannot tell us what it supports — the resolutions above are standard VESA timings. If none gives a correct picture, enter a custom timing (Enter to keep it)."))
-      table.insert(kids, ui.input({ key = "ml-" .. d.name .. "-" .. loadRev,
+      table.insert(kids, hint("This display publishes no EDID, so it cannot tell us what it supports — the resolutions above are standard VESA timings, not the panel's own. If none of them give a correct picture, enter a custom timing here."))
+      table.insert(kids, labelled("Custom timing (advanced) — overrides the resolution above", ui.input({ key = "ml-" .. d.name .. "-" .. loadRev,
         value = (edit.modelines and edit.modelines[d.name]) or "",
         placeholder = "modeline 148.50 1920 2008 2052 2200 1080 1084 1089 1125 +hsync +vsync",
         onChange = function(v)
           edit.modelines = edit.modelines or {}
           local t = noctalia.string.trim(v)
           edit.modelines[d.name] = (t ~= "") and t or nil
-        end }))
+        end })))
     end
   end
-  table.insert(kids, hint("Press Apply at the bottom to apply display changes." ..
+
+  -- dry run of the display change
+  local dirty = displaysDirty()
+  table.insert(kids, ui.row({ gap = 8, align = "center" }, {
+    ui.button({ text = "Preview display change", glyph = "eye", variant = "outline", controlSize = "sm", enabled = dirty, onClick = runPreview }),
+    ui.button({ text = "Reset display edits", variant = "ghost", controlSize = "sm", enabled = dirty,
+      onClick = function() reloadDisplays(); loadRev += 1; preview = nil; previewErr = nil; render() end }),
+  }))
+  if previewErr ~= nil then
+    table.insert(kids, ui.label({ text = "Would be refused: " .. previewErr, color = "error", maxWidth = W, maxLines = 4 }))
+  elseif preview ~= nil and dirty then
+    local md = "**Applied live:**\n\n```lua\n" .. table.concat(preview.live_calls or {}, "\n") .. "\n```\n"
+    if preview.persisted then
+      md ..= "\n**monitors.lua would become:**\n\n```lua\n" .. tostring(preview.monitors_lua or "") .. "```\n"
+    else
+      md ..= "\nNot persisted: hyprland.lua has not been migrated, so the change lasts until the next Hyprland reload.\n"
+    end
+    table.insert(kids, ui.markdown({ key = "preview", text = md, width = W }))
+  end
+  table.insert(kids, hint("Press Apply at the bottom to apply display changes. They take effect immediately; you'll get a Keep / Revert prompt in case something goes dark." ..
     ((snap and not snap.migrated) and " Changes reset on a Hyprland reload until you use “Persist displays” in General (one-time)." or "")))
   return ui.column({ gap = 10 }, kids)
 end
@@ -526,7 +627,7 @@ local function zonePreview(l)
     return ui.column({ key = "cell" .. zi, width = w, height = hh, fill = ZONE_FILL[zi + 1], border = ZONE_HEX[zi + 1],
                        borderWidth = 2, radius = 4, align = "center", justify = "center" }, {
       ui.label({ text = order and tostring(order) or "–", fontSize = 20, fontWeight = "bold", color = ZONE_HEX[zi + 1] }),
-      ui.label({ text = ZONE_NAMES[zi + 1] .. (splits and " · splits" or ""), fontSize = 11, color = ZONE_HEX[zi + 1] }),
+      ui.label({ text = ZONE_NAMES[zi + 1] .. (splits and "  ⊞" or ""), fontSize = 11, color = ZONE_HEX[zi + 1] }),
     })
   end
   if (l.zones or 4) == 2 then
@@ -582,13 +683,27 @@ local function zonesTab()
   end
   local l = layoutOf(mon)
   table.insert(kids, ui.row({ justify = "center" }, { zonePreview(l) }))
-  table.insert(kids, labelled("Vertical divider — left column " .. math.floor((l.vsplit or 1 / 3) * 100 + 0.5) .. "%",
-    ui.slider({ key = "vs-" .. mon, min = 5, max = 95, step = 1, value = math.floor((l.vsplit or 1 / 3) * 100 + 0.5),
-      onChange = function(v) l.vsplit = (tonumber(v) or 33) / 100; render() end })))
+  -- a slider plus a typed percentage (v4's spin box), both clamped to 5–95 %
+  local function divider(title, field, keyp)
+    local pct = math.floor((l[field] or 1 / 3) * 100 + 0.5)
+    return labelled(title, ui.row({ gap = 10, align = "center" }, {
+      ui.slider({ key = keyp .. "-s-" .. mon, min = 5, max = 95, step = 1, value = pct, flexGrow = 1,
+        onChange = function(v) l[field] = math.clamp(tonumber(v) or 33, 5, 95) / 100; loadRev += 1; render() end }),
+      ui.input({ key = keyp .. "-i-" .. mon .. "-" .. loadRev, value = tostring(pct), width = 70, controlSize = "sm",
+        onSubmit = function(v)
+          local n = tonumber((string.gsub(v, "%%", "")))
+          if n then
+            l[field] = math.clamp(math.floor(n + 0.5), 5, 95) / 100
+          end
+          loadRev += 1
+          render()
+        end }),
+      ui.label({ text = "%", color = "on_surface_variant" }),
+    }))
+  end
+  table.insert(kids, divider("Left column width", "vsplit", "vs"))
   if zc == 4 then
-    table.insert(kids, labelled("Horizontal divider — top row " .. math.floor((l.hsplit or 1 / 3) * 100 + 0.5) .. "%",
-      ui.slider({ key = "hs-" .. mon, min = 5, max = 95, step = 1, value = math.floor((l.hsplit or 1 / 3) * 100 + 0.5),
-        onChange = function(v) l.hsplit = (tonumber(v) or 33) / 100; render() end })))
+    table.insert(kids, divider("Top row height", "hsplit", "hs"))
   end
 
   table.insert(kids, hint("Fill order (top = first) · the toggle marks a zone that subdivides when a second window lands"))
@@ -596,7 +711,7 @@ local function zonesTab()
   for i, zi in ipairs(fill) do
     local sub = l.subdivide or {}
     local on = indexOf(sub, zi) ~= nil
-    table.insert(kids, orderRow("fill-" .. mon .. "-" .. zi, i .. ".  " .. ZONE_NAMES[zi + 1], i == 1, i == #fill,
+    table.insert(kids, orderRow("fill-" .. mon .. "-" .. zi, i .. ".  " .. ZONE_EMOJI[zi + 1] .. " " .. ZONE_NAMES[zi + 1], i == 1, i == #fill,
       function() l.fill = swapIn(fill, i, i - 1); render() end,
       function() l.fill = swapIn(fill, i, i + 1); render() end,
       ui.row({ gap = 6, align = "center" }, {
@@ -618,7 +733,7 @@ local function zonesTab()
   if #sub >= 2 then
     table.insert(kids, hint("Subdivision fill order"))
     for i, zi in ipairs(sub) do
-      table.insert(kids, orderRow("sub-" .. mon .. "-" .. zi, i .. ".  " .. ZONE_NAMES[zi + 1], i == 1, i == #sub,
+      table.insert(kids, orderRow("sub-" .. mon .. "-" .. zi, i .. ".  " .. ZONE_EMOJI[zi + 1] .. " " .. ZONE_NAMES[zi + 1], i == 1, i == #sub,
         function() l.subdivide = swapIn(sub, i, i - 1); render() end,
         function() l.subdivide = swapIn(sub, i, i + 1); render() end, nil))
     end
@@ -642,8 +757,15 @@ local function allKeybindGroups()
   return groups
 end
 
+local function prettyCombo(c)
+  c = string.gsub(c, "mouse:272", "Left click")
+  c = string.gsub(c, "mouse:273", "Right click")
+  c = string.gsub(c, "mouse:274", "Middle click")
+  return c
+end
+
 local function comboPill(id, combo, shown)
-  return ui.button({ key = "pill-" .. id .. "-" .. combo, text = shown or combo, glyph = "x", controlSize = "sm", variant = "secondary",
+  return ui.button({ key = "pill-" .. id .. "-" .. combo, text = shown or prettyCombo(combo), glyph = "x", controlSize = "sm", variant = "secondary",
     tooltip = "Remove", onClick = function() removeCombo(id, combo); render() end })
 end
 
@@ -665,7 +787,9 @@ local function keybindRow(item)
       local shown = (string.sub(c, -#SUFFIX) == SUFFIX) and string.sub(c, 1, #c - #SUFFIX) or c
       table.insert(kids, comboPill(id, c, shown))
     end
-    table.insert(kids, ui.label({ text = "+ Left click", color = "on_surface_variant", fontSize = 12 }))
+    if #combosOf(id) > 0 then -- the fixed half: shown beside the pill, never removable
+      table.insert(kids, ui.label({ text = "+ Left click", color = "on_surface_variant", fontSize = 12 }))
+    end
     table.insert(kids, ui.input({ key = "kbadd-" .. id .. "-" .. addRev, placeholder = "modifiers, e.g. SUPER", width = 170, controlSize = "sm",
       onSubmit = function(v)
         local mods = normalizeCombo(v, true)
@@ -841,7 +965,7 @@ function render()
   else
     content = generalTab()
   end
-  table.insert(body, ui.scroll({ key = "scroll-" .. tab, flexGrow = 1, gap = 12 }, { content }))
+  table.insert(body, ui.scroll({ key = "scroll-" .. tab, flexGrow = 1, gap = 12, scrollToBottomRev = scrollRev }, { content }))
   local dirty = configDirty() or displaysDirty()
   table.insert(body, ui.row({ gap = 8, align = "center" }, {
     ui.label({ text = dirty and "Unsaved changes" or "", color = "on_surface_variant", flexGrow = 1 }),
@@ -901,8 +1025,23 @@ end
 -- While the panel is open:
 --   noctalia msg plugin shashank/hyperzone:settings all tab <1-4>
 --   noctalia msg plugin shashank/hyperzone:settings all screen <connector>
+--   noctalia msg plugin shashank/hyperzone:settings all drop "<screen> <drop value>"
+--     the same edit a drag-and-drop makes, e.g. "DP-1 right:HDMI-A-2" or "DP-1 at:-1920:0"
+--     (only edits the form; nothing is applied until Apply)
+--   noctalia msg plugin shashank/hyperzone:settings all preview   (dry run, shown under the editor)
+--   noctalia msg plugin shashank/hyperzone:settings all bottom    (scroll the tab to its end)
 function onIpc(event, payload)
-  if event == "screen" and payload ~= nil and edit.managed and edit.managed[payload] ~= nil then
+  if event == "drop" and payload ~= nil then
+    local who, value = string.match(payload, "^(%S+)%s+(%S+)$")
+    if who ~= nil then
+      onArrangeDrop(who, value)
+    end
+  elseif event == "bottom" then
+    scrollRev += 1
+    render()
+  elseif event == "preview" then
+    runPreview()
+  elseif event == "screen" and payload ~= nil and edit.managed and edit.managed[payload] ~= nil then
     zoneMon = payload
     render()
   elseif event == "tab" then

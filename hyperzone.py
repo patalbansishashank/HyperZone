@@ -2955,15 +2955,10 @@ class Daemon(HyperZone):
                 log("monitor eval:", spec.get("name"), "->", reply.strip())
         self.invalidate_monitors()   # geometry just changed under the cache
 
-    def rpc_apply_monitor_layout(self, params):
-        """Reconfigure displays LIVE (Lua `eval`), then arm a daemon-enforced revert:
-        unless confirm_monitor_layout arrives within timeout_s, we re-apply the
-        previous live specs automatically. Survives the UI dying or every screen
-        going dark — recovery needs zero user input. Migration is NOT required to
-        apply; it only decides whether the change is persisted to monitors.lua
-        (so it survives a config reload) or is runtime-only until the next reload."""
-        if self.layout_revert_at is not None:
-            raise ValueError("a display change is already pending confirmation")
+    def _layout_specs(self, params):
+        """Validate a UI display layout and turn it into monitor specs (keyed by desc:
+        where the panel identifies itself). Shared by apply and its dry run, so the
+        preview can never disagree with what an apply would do."""
         mons = params.get("monitors")
         if not isinstance(mons, list) or not mons:
             raise ValueError("monitors must be a non-empty list")
@@ -3009,6 +3004,35 @@ class Daemon(HyperZone):
         over = crtc_overcommit(specs)
         if over:
             raise ValueError(over)
+        return specs
+
+    def rpc_preview_monitor_layout(self, params):
+        """Dry run of apply_monitor_layout: validate exactly as an apply would and
+        return what it WOULD do — the live hl.monitor calls and the monitors.lua it
+        would write — without touching any display or file."""
+        specs = self._layout_specs(params)
+        migrated = hyprland_is_migrated()
+        current = ""
+        if os.path.exists(MONITORS_LUA):
+            try:
+                with open(MONITORS_LUA) as f:
+                    current = f.read()
+            except OSError:
+                pass
+        return {"specs": specs, "live_calls": [lua_monitor(sp) for sp in specs],
+                "persisted": migrated, "current_lua": current,
+                "monitors_lua": generate_monitors_lua(specs, keep_text=current) if migrated else ""}
+
+    def rpc_apply_monitor_layout(self, params):
+        """Reconfigure displays LIVE (Lua `eval`), then arm a daemon-enforced revert:
+        unless confirm_monitor_layout arrives within timeout_s, we re-apply the
+        previous live specs automatically. Survives the UI dying or every screen
+        going dark — recovery needs zero user input. Migration is NOT required to
+        apply; it only decides whether the change is persisted to monitors.lua
+        (so it survives a config reload) or is runtime-only until the next reload."""
+        if self.layout_revert_at is not None:
+            raise ValueError("a display change is already pending confirmation")
+        specs = self._layout_specs(params)
         # snapshot the exact current live state so revert is exact
         self.layout_prev_specs = self._live_specs()
         migrated = hyprland_is_migrated()
@@ -3113,6 +3137,7 @@ class Daemon(HyperZone):
         "retile": rpc_retile,
         "set_capture_mode": rpc_set_capture_mode,
         "apply_monitor_layout": rpc_apply_monitor_layout,
+        "preview_monitor_layout": rpc_preview_monitor_layout,
         "confirm_monitor_layout": rpc_confirm_monitor_layout,
         "revert_monitor_layout": rpc_revert_monitor_layout,
         "migrate_hyprland_config": rpc_migrate_hyprland_config,
